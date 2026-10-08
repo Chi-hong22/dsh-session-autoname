@@ -1,0 +1,38 @@
+{
+  "name": "@chi-hong22/dsh-session-autoname",
+  "version": "0.1.0",
+  "private": true,
+  "description": "First-turn session auto-naming in the strict MMDD|type|topic form for DeepSeek Harness, plus on-demand naming of any specified conversation from its whole content, as an out-of-tree DSH plugin bundle",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "session-title"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "session-naming.js",
+  "exports": {
+    ".": "./session-naming.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node --test tests/provider.test.mjs"
+  },
+  "files": [
+    "session-naming.js",
+    "cordis.patch.yml",
+    "README.md",
+    "tools/history-evidence.mjs",
+    "tests/provider.test.mjs"
+  ],
+  "dependencies": {},
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  }
+}

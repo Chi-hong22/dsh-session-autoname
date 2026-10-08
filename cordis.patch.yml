@@ -1,0 +1,11 @@
+# dsh bundle patch: inserts this plugin into a profile's layer stack.
+#
+# This plugin needs exactly one row. Unlike the stock
+# @deepseek-ai/dsh-session-title-first-prompt-llm provider, it does not register a
+# title provider at all (that slot accepts exactly one), so no other row has to be
+# disabled: it names a session from the `turn/end` event of its first turn and
+# writes through sessionTitle.rename(), whose supersede() aborts any in-flight
+# automatic generation for that session.
+- insert:
+    - id: session-autoname
+      name: '@chi-hong22/dsh-session-autoname'
