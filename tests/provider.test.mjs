@@ -22,7 +22,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
  * @param turns - one entry per turn: its human prompt, the assistant's final
  * text, the tools it called, and the turn's end reason kind.
  */
-function buildLog(turns) {
+function buildLog(turns, { title } = {}) {
   const log = []
   const push = (type, data) => log.push({ type, data, seq: log.length, time: 0 })
   push('request/header', { header: { config: { provider: 'p', model: 'm' } }, reason: 'initial' })
@@ -44,8 +44,10 @@ function buildLog(turns) {
         message: { role: 'assistant', content: [{ type: 'text', text: turn.assistant }], source: { kind: 'model' } },
       })
     }
-    push('turn/end', { turn: n, reason: { kind: turn.end ?? 'completed' } })
+    // `end: 'open'` models a log killed mid-turn: the turn never closes.
+    if (turn.end !== 'open') push('turn/end', { turn: n, reason: { kind: turn.end ?? 'completed' } })
   }
+  if (title !== undefined) push('session/title', { title: title.title, source: title.source, messageSeqs: [] })
   return log
 }
 
@@ -68,21 +70,18 @@ function fakeSession({ createdAt, cwd = 'D:\\__CODE__\\demo', log = buildLog(FIR
 function fakeContext({
   reply = `{"title":"1002${SEP}功能${SEP}演示主题"}`,
   finish = 'stop',
-  currentTitle,
   sessions = [],
   query,
   controller,
+  timer = { timeout: (callback) => { queueMicrotask(callback); return () => {} } },
 } = {}) {
   const captured = { renames: [], listeners: {} }
-  let notify = null
-  const renamed = new Promise((resolve) => {
-    notify = resolve
-  })
   const ctx = {
     get: (key) => {
       if (key === 'sessions') return { get: (id) => sessions.find((s) => s.id === id) }
       if (key === 'sessionQuery') return query
       if (key === 'sessionController') return controller
+      if (key === 'timer') return timer ?? undefined
       return undefined
     },
     effect: (fn) => {
@@ -95,10 +94,8 @@ function fakeContext({
     },
     logger: { warn: () => {} },
     sessionTitle: {
-      get: () => currentTitle,
       rename: (session, title) => {
         captured.renames.push({ session, title })
-        notify()
         return { title, eventSeq: 1 }
       },
     },
@@ -118,23 +115,49 @@ function fakeContext({
       },
     },
   }
-  return { ctx, captured, renamed }
+  return { ctx, captured }
 }
 
-/** Drive one automatic first-turn naming attempt and report what it wrote. */
+/**
+ * Drive one automatic naming attempt and report what it wrote.
+ * @param overrides.triggerTurn - the turn whose `turn/end` fires the trigger.
+ */
 async function runAuto(options, overrides = {}) {
-  const { ctx, captured, renamed } = fakeContext(options)
-  apply(ctx)
   const session =
     overrides.session ?? fakeSession({ createdAt: overrides.createdAt ?? Date.UTC(2026, 9, 2, 1, 0, 0) })
+  // A live trigger always has its session in the live store; that is what makes
+  // the write go through `sessionTitle.rename` instead of a resume.
+  const { ctx, captured } = fakeContext({ ...options, sessions: [session] })
+  apply(ctx)
   captured.listeners['session/event'](session, {
     type: 'turn/end',
-    data: { turn: 1, reason: { kind: 'completed' } },
-    seq: 99,
+    data: { turn: overrides.triggerTurn ?? 1, reason: { kind: 'completed' } },
+    seq: 999,
   })
-  const outcome = await Promise.race([renamed.then(() => 'renamed'), sleep(1200).then(() => 'quiet')])
-  return { renamed: outcome === 'renamed', title: captured.renames[0]?.title, captured }
+  await sleep(30)
+  return {
+    renamed: captured.renames.length > 0,
+    title: captured.renames[0]?.title,
+    captured,
+  }
 }
+
+test('applies without a timer service, losing only the catch-up', async () => {
+  // The naming trigger and the admin tool must never depend on the optional
+  // catch-up being schedulable.
+  const { ctx, captured } = fakeContext({
+    timer: null,
+    query: { listSessions: async () => [], readTitleSnapshots: async () => [] },
+  })
+  apply(ctx)
+  assert.equal(typeof captured.listeners['session/event'], 'function')
+  assert.equal(captured.tool.name, 'session_title_admin')
+  const listed = await captured.tool.execute({ action: 'list' })
+  assert.ok(
+    listed.auto.recent.some((entry) => entry.outcome === 'sweep' && /timer service unavailable/.test(entry.detail)),
+    'the skipped catch-up must say why',
+  )
+})
 
 test('plugin surface: name, inject, first-turn trigger, and one admin tool', () => {
   const { ctx, captured } = fakeContext({})
@@ -216,37 +239,99 @@ test('accepts complete JSON from a max-tokens finish, rejects a truncated one', 
 })
 
 test('skips a title the human already chose, but replaces another provider\'s plain text', async () => {
-  const chosen = await runAuto({ currentTitle: { title: '既有标题', source: { kind: 'user' } } })
+  const created = Date.UTC(2026, 9, 2, 1, 0, 0)
+  const withTitle = (title, source) =>
+    fakeSession({ createdAt: created, log: buildLog(FIRST_TURN, { title: { title, source } }) })
+  const chosen = await runAuto({}, { session: withTitle('既有标题', { kind: 'user' }) })
   assert.equal(chosen.renamed, false)
   assert.equal(chosen.captured.request, undefined)
   // The stock first-prompt provider writes plain text while the turn runs; that
   // is not a reason to keep a non-compliant title.
-  const stock = await runAuto({ currentTitle: { title: 'PowerShell 含义说明', source: { kind: 'provider' } } })
+  const stock = await runAuto({}, { session: withTitle('PowerShell 含义说明', { kind: 'provider' }) })
   assert.equal(stock.renamed, true)
-  const compliant = await runAuto({
-    currentTitle: { title: `1002${SEP}修复${SEP}已合规标题`, source: { kind: 'provider' } },
-  })
+  const compliant = await runAuto(
+    {},
+    { session: withTitle(`1002${SEP}修复${SEP}已合规标题`, { kind: 'provider' }) },
+  )
   assert.equal(compliant.renamed, false)
-  const fallback = await runAuto({ currentTitle: { title: '请修复登录报错', source: { kind: 'fallback' } } })
+  const fallback = await runAuto({}, { session: withTitle('请修复登录报错', { kind: 'fallback' }) })
   assert.equal(fallback.renamed, true)
 })
 
-test('skips a first turn that did not complete, or produced no assistant work', async () => {
+test('names an interrupted first turn from the whole conversation, skips one with no work', async () => {
+  // A crash or an interrupt leaves turn 1 without a "completed" end; the session
+  // must still be nameable, from whatever the conversation actually holds.
   const aborted = await runAuto(
     {},
     {
       session: fakeSession({
-        createdAt: Date.now(),
-        log: buildLog([{ prompt: '改一下', assistant: '好的', end: 'aborted' }]),
+        createdAt: Date.UTC(2026, 9, 2, 1, 0, 0),
+        log: buildLog([{ prompt: '改一下', assistant: '已完成的部分结论', end: 'aborted' }]),
       }),
     },
   )
-  assert.equal(aborted.renamed, false)
+  assert.equal(aborted.renamed, true)
+  assert.match(aborted.captured.request.messages[0].content[0].text, /whole_conversation/)
   const empty = await runAuto(
     {},
-    { session: fakeSession({ createdAt: Date.now(), log: buildLog([{ prompt: '改一下' }]) }) },
+    { session: fakeSession({ createdAt: Date.UTC(2026, 9, 2, 1, 0, 0), log: buildLog([{ prompt: '改一下' }]) }) },
   )
   assert.equal(empty.renamed, false)
+})
+
+test('names at a later turn end when the first turn never closed', async () => {
+  const log = buildLog([
+    // `end: 'open'` is exactly how a log killed mid-turn looks after a restart.
+    { prompt: '先说需求', assistant: '部分进展', end: 'open' },
+    { prompt: '继续', assistant: '最终交付：改完并验证通过', tools: ['pwsh'] },
+  ])
+  const result = await runAuto(
+    { reply: `{"title":"1002${SEP}修复${SEP}崩溃后继续完成"}` },
+    { session: fakeSession({ createdAt: Date.UTC(2026, 9, 2, 1, 0, 0), log }), triggerTurn: 2 },
+  )
+  assert.equal(result.renamed, true)
+  assert.equal(result.title, `1002${SEP}修复${SEP}崩溃后继续完成`)
+  assert.match(result.captured.request.messages[0].content[0].text, /whole_conversation/)
+})
+
+test('catch-up sweep names a recent session whose first turn never closed', async () => {
+  const createdAt = Date.now() - 60 * 60 * 1000
+  const mmdd = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai',
+    month: '2-digit',
+    day: '2-digit',
+  })
+    .format(new Date(createdAt))
+    .replace('-', '')
+  const header = { id: 'session-crash', createdAt, cwd: 'C:\\Users\\demo' }
+  const log = buildLog([{ prompt: '崩在半路', assistant: '已完成的部分结论', end: 'open' }])
+  const writes = []
+  const query = {
+    listSessions: async () => [{ header, live: false, persisted: true }],
+    readTitleSnapshots: async () => [
+      { sessionId: 'session-crash', status: 'fulfilled', value: { session: header, title: undefined } },
+    ],
+    readSession: async () => ({ session: header, events: log }),
+  }
+  const { ctx, captured } = fakeContext({
+    query,
+    reply: `{"title":"${mmdd}${SEP}诊断${SEP}崩溃中断补偿命名"}`,
+    controller: {
+      rename: async (request) => {
+        writes.push(request)
+        return { title: request.title, seq: 3 }
+      },
+    },
+  })
+  apply(ctx)
+  await sleep(60)
+  assert.equal(writes.length, 1)
+  assert.equal(writes[0].title, `${mmdd}${SEP}诊断${SEP}崩溃中断补偿命名`)
+  const listed = await captured.tool.execute({ action: 'list' })
+  assert.ok(
+    listed.auto.recent.some((entry) => entry.outcome === 'sweep' && /named 1/.test(entry.detail)),
+    'the sweep must report what it named',
+  )
 })
 
 test('admin tool: list reports automatic outcomes, apply keeps the date rule and the write path', async () => {
@@ -281,7 +366,8 @@ test('admin tool: list reports automatic outcomes, apply keeps the date rule and
 
   const listed = await tool.execute({ action: 'list' })
   assert.equal(listed.count, 2)
-  assert.equal(listed.auto.trigger, 'session/event turn/end(turn 1)')
+  assert.equal(listed.auto.trigger, 'session/event turn/end (any turn)')
+  assert.equal(typeof listed.auto.catch_up.window_ms, 'number')
   // Newest first: the cold 0921 session precedes the live 0920 one.
   assert.equal(listed.items[0].mmdd, '0921')
   assert.equal(listed.items[1].mmdd, '0920')

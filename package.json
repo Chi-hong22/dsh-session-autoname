@@ -1,8 +1,8 @@
 {
   "name": "@chi-hong22/dsh-session-autoname",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "First-turn session auto-naming in the strict MMDD|type|topic form for DeepSeek Harness, plus on-demand naming of any specified conversation from its whole content, as an out-of-tree DSH plugin bundle",
+  "description": "Session auto-naming in the strict MMDD|type|topic form for DeepSeek Harness: once at a conversation's first naming opportunity, with a bounded catch-up sweep for sessions lost to a crash, plus on-demand naming of any specified conversation from its whole content, as an out-of-tree DSH plugin bundle",
   "keywords": [
     "dsh",
     "dsh-plugin",

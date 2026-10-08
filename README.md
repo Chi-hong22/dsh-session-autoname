@@ -1,8 +1,10 @@
 # @chi-hong22/dsh-session-autoname
 
-DeepSeek Harness host plugin: name a new conversation once, on its first turn, as
-`MMDD｜类型｜主题` — the DSH port of a Codex `Stop`-hook renaming setup. It also
-names any specified conversation on demand by summarizing its whole content.
+DeepSeek Harness host plugin: name a new conversation once, at its first naming
+opportunity, as `MMDD｜类型｜主题` — the DSH port of a Codex `Stop`-hook renaming
+setup. It also names any specified conversation on demand by summarizing its whole
+content, and it catches up on sessions that were never named because the host died
+mid-turn.
 
 Installs as a profile bundle — from GitHub, or from the out-of-tree working copy at
 `D:\__CODE__\_tookit\261002_dsh-session-autoname`:
@@ -16,20 +18,25 @@ dsh plugin --profile desktop add "D:/__CODE__/_tookit/261002_dsh-session-autonam
 
 ## Responsibilities
 
-### 1. Automatic first-turn naming
+### 1. Automatic naming
 
-- Trigger: the durable `turn/end` event of turn 1 on a root session
-  (`session/event`). No `hooks.json`, no `Stop` handler, and **no title provider
+- Trigger: the durable `turn/end` event of ANY turn on a root session
+  (`session/event`) — normally turn 1, but also a later turn when the first one was
+  lost. No `hooks.json`, no `Stop` handler, and **no title provider
   registration** — see below.
-- Evidence: the user request plus the work the assistant actually completed in
-  that turn (final text, tool calls), folded from the session log.
+- Evidence: turn 1's own completed result when it has one (the user request plus
+  the work that turn actually delivered, folded from the session log); otherwise
+  the whole conversation so far, which is what keeps a session whose first turn was
+  interrupted or killed still nameable.
 - Date: `MMDD` from the session's own `header.createdAt` in `Asia/Shanghai`
   (never `updatedAt`, never the host clock).
 - Write: `ctx.sessionTitle.rename()`, the interface the GUI itself uses.
-- Skip conditions: not a root session; the turn did not end `completed`; no
-  assistant text; the human already renamed the session; the title is already
-  compliant. Every failure keeps the title already on the session, and the reason
-  is recorded in the admin tool's `auto.recent` ring.
+- Skip conditions: not a root session; no assistant text anywhere; the human
+  already renamed the session; the title is already compliant. Every failure keeps
+  the title already on the session, and the reason is recorded in the admin tool's
+  `auto.recent` ring.
+- Exactly once: a compliant title, or a user-chosen one, ends the attempts, so
+  later turns do nothing.
 
 Accepted output is rebuilt from validated parts and must be exactly
 `MMDD｜类型｜主题`: the date must equal the `createdAt`-derived value, the type must
@@ -55,6 +62,23 @@ outcomes), `inspect` (one session's first-turn evidence), `apply` (exact renames
 each re-validated against that session's own `createdAt`), `archive` (hide
 throwaway test sessions), `selftest` (create a throwaway session and prove real
 first-turn auto-naming end to end).
+
+### 3. Catch-up sweep after a crash or restart
+
+The trigger above is a live event, so a host that dies mid-turn never delivers the
+`turn/end` that would have named the session — and after the restart that turn is
+restored as an open turn that can never end as `completed`. Five seconds after this
+plugin applies, it therefore names every root session that is **still without a
+compliant title** and holds assistant work, inside a bounded window:
+
+| Bound | Value | Why |
+|---|---|---|
+| window | 48 h of `header.createdAt` | the crash case is minutes old; older sessions are reached when they are continued, or by `summarize` |
+| cap | 5 named per start | a start must never become a mass rename of history |
+| delay | 5 s | the sweep must not compete with the host's own startup |
+
+Each outcome lands in `auto.recent` (`named` / `skipped` / `failed`, plus one
+`sweep` line carrying the counts), so a start can be audited without reading logs.
 
 ## Why nothing has to be disabled
 
@@ -108,7 +132,7 @@ the loader sees a URL it has not cached.
 ## Verifying
 
 ```powershell
-node --test tests/provider.test.mjs      # offline: rules, rejections, trigger skips, admin tool
+node --test tests/provider.test.mjs      # offline: rules, rejections, trigger skips, catch-up, admin tool
 node tools/history-evidence.mjs 0        # read-only first-turn digests of root sessions
 ```
 
@@ -120,8 +144,13 @@ path, and `{"action":"list"}` to read the recent automatic outcomes.
 - Automatic naming cannot run "before the answer is delivered": DSH streams the
   answer to the browser while the turn runs. The title lands as soon as the first
   turn closes, without delaying it.
-- A first turn that ends `aborted`, `interrupted`, `error`, or `max-tokens` is not
-  auto-named, because its work is not a completed result. Use `summarize`.
+- A first turn that ends `aborted`, `interrupted`, `error`, or `max-tokens` is
+  named from the whole conversation instead of from that turn's partial result, and
+  the model is told to stay conservative about the type. Only a session with no
+  assistant work at all is left unnamed — name it later with `summarize`.
+- The catch-up sweep is bounded (48 h, 5 per start). A session older than the window
+  that was never continued and never named keeps its placeholder until `summarize`
+  is asked for it.
 - `sessionController.rename` resumes a cold session, so naming one whose recorded
   `agentPreset` no longer exists fails with `Unknown agent preset`.
 - `D:\__CODE__` is inside a file-sync scope on this machine, so in-place edits can
