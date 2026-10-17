@@ -314,6 +314,21 @@ test('the correction is not anchored on the placeholder this plugin wrote itself
   assert.match(captured.request.messages[0].content[0].text, /"current_title":null/)
 })
 
+test('a genuine 探索 title is still anchored; only the derived placeholder is not', async () => {
+  const createdAt = Date.UTC(2026, 9, 2, 1, 0, 0)
+  const log = buildLog(FIRST_TURN, {
+    title: { title: `1002${SEP}探索${SEP}排查登录链路`, source: { kind: 'provider' } },
+  })
+  const { captured } = await runAuto(
+    { reply: `{"title":"1002${SEP}探索${SEP}排查登录链路"}` },
+    { session: fakeSession({ id: 'session-anchor-real', createdAt, log }) },
+  )
+  assert.match(
+    captured.request.messages[0].content[0].text,
+    /"current_title":"1002｜探索｜排查登录链路"/,
+  )
+})
+
 test('a later turn reads the whole conversation and carries the current title', async () => {
   const turns = [
     { prompt: '先说需求', assistant: '部分进展', end: 'open' },
@@ -426,7 +441,7 @@ test('catch-up sweep refreshes a recent session the schedule cannot reach', asyn
   assert.equal(captured.refreshes.length, 1)
   assert.equal(captured.renames.length, 0, 'a refresh keeps the title a provider title')
   assert.ok(
-    listed.auto.recent.some((entry) => entry.outcome === 'sweep' && /named 1/.test(entry.detail)),
+    listed.auto.recent.some((entry) => entry.outcome === 'sweep' && /refreshed 1/.test(entry.detail)),
     'the sweep must report what it refreshed',
   )
 })

@@ -14,8 +14,9 @@
  *   requests plus the work the assistant actually completed) and returns
  *   `MMDD｜类型｜主题`.
  * - The service owns validation, the `messageSeqs` contract and persistence, and
- *   everything written is a provider-source title, so later turns keep updating
- *   it instead of pinning it.
+ *   automatic naming writes provider-source titles, so later turns keep updating
+ *   them instead of pinning. Only the explicit admin `apply` and `summarize`
+ *   actions rename, and that pin is exactly what was asked for.
  * - The service schedules BEFORE the turn runs, so a session's first title has no
  *   assistant work to classify yet. That one is a `探索` placeholder, refreshed
  *   once when the turn ends; after that the schedule alone is enough.
@@ -82,13 +83,14 @@ const TURN_OUTCOME_BYTES = 360
 /** Default window of the admin tool's history listing (two months). */
 const HISTORY_WINDOW_MS = 60 * 24 * 60 * 60 * 1000
 /**
- * Catch-up policy. The trigger below is a live event, so anything that happened
- * while this host was not running (a crash mid-turn, a restart, this plugin being
- * mounted later) left no chance to name. After start, every root session created
- * inside this window that still carries no compliant title is named once.
+ * Catch-up policy. The provider is only called while this host is running, so two
+ * states outlive a restart: a session whose first title is still the placeholder
+ * (its turn-end correction never ran) and a session created while the plugin was
+ * not mounted (no title at all). After start, recent root sessions in either state
+ * are refreshed once through the same provider slot.
  *
  * The window and the cap bound that sweep, so a start can never become a mass
- * rename of history: older sessions are reached by the turn trigger when they are
+ * rename of history: older sessions are reached by the scheduler when they are
  * actually continued, or on request through the `summarize` action.
  */
 const CATCHUP_WINDOW_MS = 48 * 60 * 60 * 1000
@@ -551,7 +553,12 @@ function fallbackTitleOf(mmdd, prompt, projects) {
   return `${mmdd}${SEPARATOR}探索${SEPARATOR}会话记录`
 }
 
-/** Whether a title has the shape of the deterministic placeholder. */
+/**
+ * Whether a title could be the deterministic placeholder: same date and type. A
+ * model may legitimately choose `探索` too, so this only widens the sweep's
+ * candidates; the sweep then requires exact equality with the derived string
+ * before treating a title as the plugin's own.
+ */
 function isPlaceholderShaped(title, mmdd) {
   return typeof title === 'string' && title.startsWith(`${mmdd}${SEPARATOR}探索${SEPARATOR}`)
 }
@@ -581,13 +588,15 @@ async function generateSessionTitle(ctx, request) {
   if (!isRootSession(header)) return { title: placeholder(), messageSeqs: message_seqs }
   const events = session.snapshotEvents()
   const state = titleStateOf(events)
-  // The placeholder this plugin wrote moments ago is not evidence: anchoring the
-  // turn-end correction on it would invite the model to return it verbatim, and the
-  // correction would clear itself while leaving a placeholder behind.
+  // A title this plugin derived itself (the placeholder) is not evidence: anchoring
+  // the turn-end correction on it would invite the model to return it verbatim, and
+  // the correction would clear itself while leaving a placeholder behind. Compare
+  // the derived string instead of in-memory bookkeeping, so the rule also holds for
+  // the catch-up sweep after a host restart.
   const anchored =
-    !pending_evidence.has(session_id) &&
     state?.source?.kind === 'provider' &&
-    isCompliantTitle(state.title, mmdd)
+    isCompliantTitle(state.title, mmdd) &&
+    state.title !== placeholder()
   const current_title = anchored ? state.title : null
   let data
   try {
@@ -683,7 +692,8 @@ function correctPlaceholderTitle(ctx, session) {
  * predates this plugin keeps its old title until it is continued.
  *
  * Runs once, a few seconds after this plugin applies: refresh every recent root
- * session that still carries no compliant title. `refresh` keeps the title a
+ * session without a compliant title, plus every one still carrying this plugin's
+ * own placeholder after its turn produced work. `refresh` keeps the title a
  * provider title, so the schedule keeps updating it later; a rename would pin it.
  * Older sessions are deliberately out of scope — the schedule reaches them when
  * they are continued, and the `summarize` action reaches them on request.
@@ -719,11 +729,11 @@ async function sweep(ctx) {
     if (compliant && !isPlaceholderShaped(state.title, mmdd)) continue
     pending.push({ header: record.header, mmdd, title: state?.title ?? null, placeholder: compliant })
   }
-  let named = 0
+  let refreshed = 0
   let skipped = 0
   let failed = 0
   for (const entry of pending) {
-    if (named >= CATCHUP_MAX) break
+    if (refreshed >= CATCHUP_MAX) break
     const session_id = entry.header.id
     try {
       const snapshot = await query.readSession(session_id)
@@ -753,7 +763,7 @@ async function sweep(ctx) {
       const found = await controller.resolveAgent(session_id)
       if ('error' in found) throw found.error
       await ctx.sessionTitle.refresh(found.agent.session)
-      named += 1
+      refreshed += 1
       remember({ session_id, outcome: 'named', detail: 'catch-up refresh' })
     } catch (error) {
       failed += 1
@@ -764,7 +774,7 @@ async function sweep(ctx) {
   }
   remember({
     outcome: 'sweep',
-    detail: `recent ${records.length}, candidates ${pending.length}, named ${named}, skipped ${skipped}, failed ${failed}`,
+    detail: `recent ${records.length}, candidates ${pending.length}, refreshed ${refreshed}, skipped ${skipped}, failed ${failed}`,
   })
 }
 
