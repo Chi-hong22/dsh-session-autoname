@@ -551,6 +551,11 @@ function fallbackTitleOf(mmdd, prompt, projects) {
   return `${mmdd}${SEPARATOR}探索${SEPARATOR}会话记录`
 }
 
+/** Whether a title has the shape of the deterministic placeholder. */
+function isPlaceholderShaped(title, mmdd) {
+  return typeof title === 'string' && title.startsWith(`${mmdd}${SEPARATOR}探索${SEPARATOR}`)
+}
+
 /**
  * One provider generation, exactly as the title service calls it.
  *
@@ -576,8 +581,14 @@ async function generateSessionTitle(ctx, request) {
   if (!isRootSession(header)) return { title: placeholder(), messageSeqs: message_seqs }
   const events = session.snapshotEvents()
   const state = titleStateOf(events)
-  const current_title =
-    state?.source?.kind === 'provider' && isCompliantTitle(state.title, mmdd) ? state.title : null
+  // The placeholder this plugin wrote moments ago is not evidence: anchoring the
+  // turn-end correction on it would invite the model to return it verbatim, and the
+  // correction would clear itself while leaving a placeholder behind.
+  const anchored =
+    !pending_evidence.has(session_id) &&
+    state?.source?.kind === 'provider' &&
+    isCompliantTitle(state.title, mmdd)
+  const current_title = anchored ? state.title : null
   let data
   try {
     const folds = foldTurns(events)
@@ -701,21 +712,43 @@ async function sweep(ctx) {
     if (record === undefined) continue
     const state = result.value.title
     const mmdd = mmddOf(record.header.createdAt)
-    if (state !== undefined && (state.source?.kind === 'user' || isCompliantTitle(state.title, mmdd))) continue
-    pending.push(result.sessionId)
+    if (state?.source?.kind === 'user') continue
+    // A placeholder is compliant by construction, so compliance alone would hide
+    // every session whose first turn completed while the host was already gone.
+    const compliant = state !== undefined && isCompliantTitle(state.title, mmdd)
+    if (compliant && !isPlaceholderShaped(state.title, mmdd)) continue
+    pending.push({ header: record.header, mmdd, title: state?.title ?? null, placeholder: compliant })
   }
   let named = 0
   let skipped = 0
   let failed = 0
-  for (const session_id of pending) {
+  for (const entry of pending) {
     if (named >= CATCHUP_MAX) break
+    const session_id = entry.header.id
     try {
       const snapshot = await query.readSession(session_id)
+      const folds = foldTurns(snapshot.events)
       // The service builds its request from the session's own eligible human
       // messages; a session with none can never yield a valid provider result.
-      if (!foldTurns(snapshot.events).turns.some((turn) => turn.prompt !== '')) {
+      const prompt = folds.turns.find((turn) => turn.prompt !== '')?.prompt ?? ''
+      if (prompt === '') {
         skipped += 1
         continue
+      }
+      if (entry.placeholder) {
+        // Only the exact placeholder this plugin derives, and only once there is
+        // work to classify: a real 探索 title must survive, and a refresh without
+        // evidence would just rewrite the same placeholder.
+        const first = folds.turns[0]
+        const classifiable =
+          folds.turns.length > 1
+            ? folds.turns.some((turn) => turn.outcome !== '')
+            : first !== undefined && first.end === 'completed' && first.outcome !== ''
+        const expected = fallbackTitleOf(entry.mmdd, prompt, await projectNamesOf(ctx, entry.header))
+        if (entry.title !== expected || !classifiable) {
+          skipped += 1
+          continue
+        }
       }
       const found = await controller.resolveAgent(session_id)
       if ('error' in found) throw found.error

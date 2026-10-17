@@ -52,7 +52,8 @@ this plugin owns the judgement:
 - Staying stable across turns: the request carries the current title, and the model
   is told to return it verbatim while it still describes the main task. A type or
   topic changes only when the task itself changed — not every turn produces a new
-  title.
+  title. The placeholder is never carried as that anchor, so the correction always
+  replaces it instead of being told to keep it.
 - Date: `MMDD` from the session's own `header.createdAt` in `Asia/Shanghai`
   (never `updatedAt`, never the host clock).
 - Skip conditions: a subagent session (deterministic placeholder, no model call);
@@ -94,10 +95,13 @@ that session's own `createdAt`), `archive` (hide throwaway test sessions),
 
 The schedule belongs to the service, and a host that dies mid-turn or before the
 first main request never reaches it. Five seconds after this plugin applies it
-therefore refreshes every root session that is **still without a compliant title**
-and holds a human prompt, inside a bounded window. A cold session is resumed through
+therefore refreshes every root session that is **still without a compliant title**,
+plus every recent session **still carrying the deterministic placeholder** after its
+turn produced work, inside a bounded window. A cold session is resumed through
 `sessionController.resolveAgent` to obtain the live session the service needs; the
-write stays provider-source, so it never pins.
+write stays provider-source, so it never pins. A placeholder whose turn never
+completed is left alone — there is nothing to classify yet, and the next turn names
+it.
 
 | Bound | Value | Why |
 |---|---|---|

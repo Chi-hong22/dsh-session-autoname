@@ -58,6 +58,13 @@ const FIRST_TURN = [{ prompt: '请修复登录报错', assistant: '已修复并�
 /** The placeholder a session gets before its first turn has produced anything. */
 const PLACEHOLDER = `1002${SEP}探索${SEP}请修复登录报错`
 
+/** Asia/Shanghai MMDD of one timestamp, derived the way the plugin derives it. */
+function mmddOf(timestamp) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit' })
+    .format(new Date(timestamp))
+    .replace('-', '')
+}
+
 /** Build one live-session stand-in backed by a fixed event log. */
 function fakeSession({ id = 'session-test', createdAt, cwd = 'D:\\__CODE__\\demo', log = buildLog(FIRST_TURN), header } = {}) {
   return {
@@ -266,6 +273,9 @@ test('a turn with no assistant work yet becomes a placeholder and asks for a cor
     {},
     {
       session: fakeSession({
+        // A dedicated id: the placeholder marks this session as pending, and that
+        // in-memory mark would leak into the sessions other tests name.
+        id: 'session-first-placeholder',
         createdAt: Date.UTC(2026, 9, 2, 1, 0, 0),
         log: buildLog([{ prompt: '请修复登录报错', end: 'open' }]),
       }),
@@ -282,6 +292,26 @@ test('a turn with no assistant work yet becomes a placeholder and asks for a cor
   await sleep(10)
   assert.equal(captured.refreshes.length, 1)
   assert.equal(captured.renames.length, 0, 'a refresh keeps the title a provider title')
+})
+
+test('the correction is not anchored on the placeholder this plugin wrote itself', async () => {
+  const createdAt = Date.UTC(2026, 9, 2, 1, 0, 0)
+  const empty = fakeSession({
+    id: 'session-anchor',
+    createdAt,
+    log: buildLog([{ prompt: '请修复登录报错', end: 'open' }]),
+  })
+  const first = await runAuto({}, { session: empty })
+  assert.equal(first.title, PLACEHOLDER)
+  // Same session with the placeholder as its title: the model must not be told the
+  // placeholder describes the task, or the correction would return it verbatim.
+  const log = buildLog(FIRST_TURN, { title: { title: PLACEHOLDER, source: { kind: 'provider' } } })
+  const { title, captured } = await runAuto(
+    { reply: `{"title":"1002${SEP}修复${SEP}登录报错处理"}` },
+    { session: fakeSession({ id: 'session-anchor', createdAt, log }) },
+  )
+  assert.equal(title, `1002${SEP}修复${SEP}登录报错处理`)
+  assert.match(captured.request.messages[0].content[0].text, /"current_title":null/)
 })
 
 test('a later turn reads the whole conversation and carries the current title', async () => {
@@ -370,13 +400,7 @@ test('an aborted generation rethrows so the service records nothing', async () =
 
 test('catch-up sweep refreshes a recent session the schedule cannot reach', async () => {
   const createdAt = Date.now() - 60 * 60 * 1000
-  const mmdd = new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Asia/Shanghai',
-    month: '2-digit',
-    day: '2-digit',
-  })
-    .format(new Date(createdAt))
-    .replace('-', '')
+  const mmdd = mmddOf(createdAt)
   const header = { id: 'session-crash', createdAt, cwd: 'C:\\Users\\demo' }
   const log = buildLog([{ prompt: '崩在半路', assistant: '已完成的部分结论', end: 'open' }])
   const query = {
@@ -405,6 +429,58 @@ test('catch-up sweep refreshes a recent session the schedule cannot reach', asyn
     listed.auto.recent.some((entry) => entry.outcome === 'sweep' && /named 1/.test(entry.detail)),
     'the sweep must report what it refreshed',
   )
+})
+
+test('catch-up sweep replaces a placeholder whose turn completed while the host was down', async () => {
+  // The placeholder is compliant, so a compliance-only filter would skip it and the
+  // session would keep the opening sentence as its title forever.
+  const createdAt = Date.now() - 60 * 60 * 1000
+  const mmdd = mmddOf(createdAt)
+  const header = { id: 'session-stuck', createdAt, cwd: 'C:\\Users\\demo' }
+  const log = buildLog(FIRST_TURN, {
+    title: { title: `${mmdd}${SEP}探索${SEP}请修复登录报错`, source: { kind: 'provider' } },
+  })
+  const current = log.at(-1).data
+  const query = {
+    listSessions: async () => [{ header, live: false, persisted: true }],
+    readTitleSnapshots: async () => [
+      { sessionId: 'session-stuck', status: 'fulfilled', value: { session: header, title: current } },
+    ],
+    readSession: async () => ({ session: header, events: log }),
+  }
+  const { ctx, captured } = fakeContext({
+    query,
+    reply: `{"title":"${mmdd}${SEP}修复${SEP}登录报错处理"}`,
+    controller: { resolveAgent: async () => ({ agent: { session: { id: 'session-stuck', header } } }) },
+  })
+  apply(ctx)
+  await sleep(60)
+  assert.equal(captured.refreshes.length, 1)
+})
+
+test('catch-up sweep leaves a placeholder alone until the turn has work to classify', async () => {
+  const createdAt = Date.now() - 60 * 60 * 1000
+  const mmdd = mmddOf(createdAt)
+  const header = { id: 'session-open', createdAt, cwd: 'C:\\Users\\demo' }
+  const log = buildLog([{ prompt: '崩在半路', end: 'open' }], {
+    title: { title: `${mmdd}${SEP}探索${SEP}崩在半路`, source: { kind: 'provider' } },
+  })
+  const current = log.at(-1).data
+  const query = {
+    listSessions: async () => [{ header, live: false, persisted: true }],
+    readTitleSnapshots: async () => [
+      { sessionId: 'session-open', status: 'fulfilled', value: { session: header, title: current } },
+    ],
+    readSession: async () => ({ session: header, events: log }),
+  }
+  const { ctx, captured } = fakeContext({
+    query,
+    reply: `{"title":"${mmdd}${SEP}修复${SEP}崩在半路的排查"}`,
+    controller: { resolveAgent: async () => ({ agent: { session: { id: 'session-open', header } } }) },
+  })
+  apply(ctx)
+  await sleep(60)
+  assert.equal(captured.refreshes.length, 0)
 })
 
 test('admin tool: list reports the provider, apply keeps the date rule and the write path', async () => {
