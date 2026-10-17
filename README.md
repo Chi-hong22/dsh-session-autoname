@@ -17,13 +17,16 @@ dsh plugin --profile desktop add "D:/__CODE__/_tookit/261002_dsh-session-autonam
 ```
 
 > **Mutually exclusive with the official "随对话更新的标题" plugin
-> (`@deepseek-ai/dsh-experimental-session-titles-bundle`).** Both claim the one
-> session-title provider slot. See [Choose one](#choose-one-this-plugin-or-the-official-one).
+> (`@deepseek-ai/dsh-experimental-session-titles-bundle`). Both claim the one
+> session-title provider slot — enable exactly one, never both.** See
+> [Choose one](#choose-one-this-plugin-or-the-official-one) and
+> [Switching between them](#switching-between-them).
 
 ## 中文说明
 
 - **作用**：用严格格式 `MMDD｜类型｜主题` 给根会话命名并随对话更新；也能按需（`summarize`）通读整段对话命名；启动时补扫近期未合规的会话。
 - **与官方插件互斥**：两者争抢同一个标题提供方槽位，只能启用其中一个。本插件的补丁会关掉自带的 `session-title-llm`（首条提示提供方）；若官方"随对话更新的标题"同时启用，先加载者拿到槽位，另一个在插件页显示"异常"，不会出现"显示运行却从不写标题"的空转。运行时如果槽位已被占用，本插件直接报错退出注册，绝不 `rename`、绝不钉住标题。
+- **怎么切换**：最佳状态是只开本插件；官方插件默认不在 profile 里，不打开就是关闭。要换成官方：先关掉本插件的**整个 bundle**并重启（让出槽位），再打开"随对话更新的标题"并再重启一次；换回来时反向操作。不要只关本插件内部的 `session-autoname` 行而保留 bundle——补丁仍会关着自带提供方，结果是没有任何提供方在工作，标题只剩服务兜底。
 - **节奏**：服务每收到一条人类提示调度一次标题请求（`all-prompts`），因此标题会滞后一轮；首轮请求发生在助手产出之前，只能先写占位 `MMDD｜探索｜首句前 12 字`，该轮 `turn/end` 时自动纠正为正式标题。
 - **失败处理**：模型失败或返回不合规时，保留合规占位并在 `auto.recent` 记一条 `failed`；调用被中止时什么都不写。
 - **边界**：子代理会话不发模型调用，只写确定性占位；日期取会话 `header.createdAt` 的 `Asia/Shanghai` 日期，不用主机时钟。
@@ -145,6 +148,32 @@ This plugin therefore declares the conflict instead of hiding it:
 
 Pick exactly one: this plugin if you want the strict `MMDD｜类型｜主题` format, the
 official one if you want its plain-text titles.
+
+### Switching between them
+
+The only stable configurations are "this plugin only" and "the official plugin only".
+The recommended state is this plugin on and the official one off — which is also the
+default, because the official bundle is not part of a profile until someone enables
+it.
+
+To switch to the official plugin:
+
+1. Turn **this whole bundle** off in the plugin manager (Settings → Plugins → the
+   `@chi-hong22/dsh-session-autoname` bundle row). The switch removes it from
+   `dsh.profile.bundles` in `~/.dsh/profiles/<profile>/package.json`; it does not
+   just disable the inner `session-autoname` row.
+2. Restart the app so the provider slot is released.
+3. Turn on **随对话更新的标题** (`@deepseek-ai/dsh-experimental-session-titles-bundle`,
+   listed in the official/experimental group), then restart once more so its
+   provider activates.
+
+To switch back, do the same in the opposite order: official bundle off → restart →
+this bundle on → restart.
+
+Do not leave this bundle enabled while disabling only its inner `session-autoname`
+row: the bundle patch is what keeps the stock first-prompt provider off, so that
+state has **no working provider at all** and titles fall back to the service's
+plain-text fallback. Either keep the bundle on, or turn the whole bundle off.
 
 ## Wiring
 
