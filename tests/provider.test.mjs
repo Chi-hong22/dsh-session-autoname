@@ -446,6 +446,32 @@ test('catch-up sweep refreshes a recent session the schedule cannot reach', asyn
   )
 })
 
+test('catch-up sweep leaves a session alone until it produced any work', async () => {
+  const createdAt = Date.now() - 60 * 60 * 1000
+  const header = { id: 'session-no-work', createdAt, cwd: 'C:\\Users\\demo' }
+  const log = buildLog([{ prompt: '刚发出去就崩了', end: 'open' }])
+  const query = {
+    listSessions: async () => [{ header, live: false, persisted: true }],
+    readTitleSnapshots: async () => [
+      {
+        sessionId: 'session-no-work',
+        status: 'fulfilled',
+        value: { session: header, title: undefined },
+      },
+    ],
+    readSession: async () => ({ session: header, events: log }),
+  }
+  const { ctx, captured } = fakeContext({
+    query,
+    controller: {
+      resolveAgent: async () => ({ agent: { session: { id: 'session-no-work', header } } }),
+    },
+  })
+  apply(ctx)
+  await sleep(60)
+  assert.equal(captured.refreshes.length, 0, 'nothing to classify yet')
+})
+
 test('catch-up sweep replaces a placeholder whose turn completed while the host was down', async () => {
   // The placeholder is compliant, so a compliance-only filter would skip it and the
   // session would keep the opening sentence as its title forever.

@@ -64,6 +64,8 @@ const MAX_TOPIC_CHARS = 24
 const MAX_TOPIC_BYTES = 60
 /** Topic length of the deterministic placeholder title. */
 const FALLBACK_TOPIC_CHARS = 12
+/** Type the deterministic placeholder always carries. */
+const PLACEHOLDER_TYPE = '探索'
 
 /** Timeout of one auxiliary title model call. */
 const LLM_TIMEOUT_MS = 90 * 1000
@@ -542,15 +544,15 @@ function fallbackTitleOf(mmdd, prompt, projects) {
   for (const topic of [head, '会话记录']) {
     if (topic.length === 0) continue
     try {
-      return acceptTitle(JSON.stringify({ title: `${mmdd}${SEPARATOR}探索${SEPARATOR}${topic}` }), {
-        mmdd,
-        projects,
-      })
+      return acceptTitle(
+        JSON.stringify({ title: `${mmdd}${SEPARATOR}${PLACEHOLDER_TYPE}${SEPARATOR}${topic}` }),
+        { mmdd, projects },
+      )
     } catch {
       // The next candidate is shorter and cannot repeat the project name.
     }
   }
-  return `${mmdd}${SEPARATOR}探索${SEPARATOR}会话记录`
+  return `${mmdd}${SEPARATOR}${PLACEHOLDER_TYPE}${SEPARATOR}会话记录`
 }
 
 /**
@@ -559,8 +561,11 @@ function fallbackTitleOf(mmdd, prompt, projects) {
  * candidates; the sweep then requires exact equality with the derived string
  * before treating a title as the plugin's own.
  */
-function isPlaceholderShaped(title, mmdd) {
-  return typeof title === 'string' && title.startsWith(`${mmdd}${SEPARATOR}探索${SEPARATOR}`)
+function looksLikePlaceholder(title, mmdd) {
+  return (
+    typeof title === 'string' &&
+    title.startsWith(`${mmdd}${SEPARATOR}${PLACEHOLDER_TYPE}${SEPARATOR}`)
+  )
 }
 
 /**
@@ -583,9 +588,10 @@ async function generateSessionTitle(ctx, request) {
   const mmdd = mmddOf(header.createdAt)
   const projects = await projectNamesOf(ctx, header)
   const placeholder = () => fallbackTitleOf(mmdd, messages[0]?.text ?? '', projects)
+  const placeholder_result = () => ({ title: placeholder(), messageSeqs: message_seqs })
   // Subagent runs are not conversations a person reads; naming them from their
   // own first prompt keeps the sidebar format uniform without a model call.
-  if (!isRootSession(header)) return { title: placeholder(), messageSeqs: message_seqs }
+  if (!isRootSession(header)) return placeholder_result()
   const events = session.snapshotEvents()
   const state = titleStateOf(events)
   // A title this plugin derived itself (the placeholder) is not evidence: anchoring
@@ -617,7 +623,7 @@ async function generateSessionTitle(ctx, request) {
       outcome: 'placeholder',
       detail: error instanceof Error ? error.message : String(error),
     })
-    return { title: placeholder(), messageSeqs: message_seqs }
+    return placeholder_result()
   }
   try {
     const route = request.route ?? routeOf(ctx, header, events)
@@ -631,7 +637,7 @@ async function generateSessionTitle(ctx, request) {
     pending_evidence.add(session_id)
     remember({ session_id, outcome: 'failed', detail })
     ctx.logger?.warn?.(`session-autoname: ${session_id}: ${detail}`)
-    return { title: placeholder(), messageSeqs: message_seqs }
+    return placeholder_result()
   }
 }
 
@@ -726,8 +732,13 @@ async function sweep(ctx) {
     // A placeholder is compliant by construction, so compliance alone would hide
     // every session whose first turn completed while the host was already gone.
     const compliant = state !== undefined && isCompliantTitle(state.title, mmdd)
-    if (compliant && !isPlaceholderShaped(state.title, mmdd)) continue
-    pending.push({ header: record.header, mmdd, title: state?.title ?? null, placeholder: compliant })
+    if (compliant && !looksLikePlaceholder(state.title, mmdd)) continue
+    pending.push({
+      header: record.header,
+      mmdd,
+      title: state?.title ?? null,
+      placeholder_shape: compliant,
+    })
   }
   let refreshed = 0
   let skipped = 0
@@ -745,17 +756,22 @@ async function sweep(ctx) {
         skipped += 1
         continue
       }
-      if (entry.placeholder) {
-        // Only the exact placeholder this plugin derives, and only once there is
-        // work to classify: a real 探索 title must survive, and a refresh without
-        // evidence would just rewrite the same placeholder.
-        const first = folds.turns[0]
-        const classifiable =
-          folds.turns.length > 1
-            ? folds.turns.some((turn) => turn.outcome !== '')
-            : first !== undefined && first.end === 'completed' && first.outcome !== ''
+      // Work is the only thing a title can describe. Without any assistant output
+      // a refresh would just rewrite this plugin's placeholder, or replace a
+      // readable fallback with one; the schedule names it at the next turn.
+      const first = folds.turns[0]
+      const has_work = folds.turns.some((turn) => turn.outcome !== '')
+      if (!has_work) {
+        skipped += 1
+        continue
+      }
+      if (entry.placeholder_shape) {
+        // Only the exact placeholder this plugin derives: a real `探索` title
+        // chosen by the model must survive the sweep. And only after its own turn
+        // finished — a turn still running gets the turn-end correction instead.
+        const completed = folds.turns.length > 1 || (first !== undefined && first.end === 'completed')
         const expected = fallbackTitleOf(entry.mmdd, prompt, await projectNamesOf(ctx, entry.header))
-        if (entry.title !== expected || !classifiable) {
+        if (entry.title !== expected || !completed) {
           skipped += 1
           continue
         }

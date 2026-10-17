@@ -20,6 +20,14 @@ dsh plugin --profile desktop add "D:/__CODE__/_tookit/261002_dsh-session-autonam
 > (`@deepseek-ai/dsh-experimental-session-titles-bundle`).** Both claim the one
 > session-title provider slot. See [Choose one](#choose-one-this-plugin-or-the-official-one).
 
+## 中文说明
+
+- **作用**：用严格格式 `MMDD｜类型｜主题` 给根会话命名并随对话更新；也能按需（`summarize`）通读整段对话命名；启动时补扫近期未合规的会话。
+- **与官方插件互斥**：两者争抢同一个标题提供方槽位，只能启用其中一个。本插件的补丁会关掉自带的 `session-title-llm`（首条提示提供方）；若官方"随对话更新的标题"同时启用，先加载者拿到槽位，另一个在插件页显示"异常"，不会出现"显示运行却从不写标题"的空转。运行时如果槽位已被占用，本插件直接报错退出注册，绝不 `rename`、绝不钉住标题。
+- **节奏**：服务每收到一条人类提示调度一次标题请求（`all-prompts`），因此标题会滞后一轮；首轮请求发生在助手产出之前，只能先写占位 `MMDD｜探索｜首句前 12 字`，该轮 `turn/end` 时自动纠正为正式标题。
+- **失败处理**：模型失败或返回不合规时，保留合规占位并在 `auto.recent` 记一条 `failed`；调用被中止时什么都不写。
+- **边界**：子代理会话不发模型调用，只写确定性占位；日期取会话 `header.createdAt` 的 `Asia/Shanghai` 日期，不用主机时钟。
+
 ## How it runs
 
 The title service (`@deepseek-ai/dsh-session-title`) owns scheduling and storage;
@@ -95,13 +103,15 @@ that session's own `createdAt`), `archive` (hide throwaway test sessions),
 
 The schedule belongs to the service, and a host that dies mid-turn or before the
 first main request never reaches it. Five seconds after this plugin applies it
-therefore refreshes every root session that is **still without a compliant title**,
-plus every recent session **still carrying the deterministic placeholder** after its
-turn produced work, inside a bounded window. A cold session is resumed through
+therefore refreshes recent root sessions that are **still without a compliant
+title**, plus those **still carrying the deterministic placeholder**, inside a
+bounded window. Either way the session must already contain assistant work: with
+nothing produced there is nothing to classify, and a refresh would only rewrite the
+same placeholder or replace a readable fallback with one. A placeholder is replaced
+only once its own turn finished — a turn still running gets the `turn/end`
+correction instead. A cold session is resumed through
 `sessionController.resolveAgent` to obtain the live session the service needs; the
-write stays provider-source, so it never pins. A placeholder whose turn never
-completed is left alone — there is nothing to classify yet, and the next turn names
-it.
+write stays provider-source, so it never pins.
 
 | Bound | Value | Why |
 |---|---|---|
