@@ -1,8 +1,8 @@
 {
   "name": "@chi-hong22/dsh-session-autoname",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
-  "description": "Session auto-naming in the strict MMDD|type|topic form for DeepSeek Harness: once at a conversation's first naming opportunity, with a bounded catch-up sweep for sessions lost to a crash, plus on-demand naming of any specified conversation from its whole content, as an out-of-tree DSH plugin bundle",
+  "description": "Session auto-naming in the strict MMDD｜type｜topic form for DeepSeek Harness: registers the single session-title provider so the official conversation-following schedule drives it, disables the stock first-prompt provider in its bundle patch, names from the whole turn (human prompt, assistant work, tool calls), and keeps the on-demand naming of any specified conversation. Mutually exclusive with the official conversation-following titles plugin: both claim the same provider slot",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -14,7 +14,8 @@
   "main": "session-naming.js",
   "exports": {
     ".": "./session-naming.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
   },
   "dsh": {
     "bundle": {
@@ -27,6 +28,7 @@
   "files": [
     "session-naming.js",
     "cordis.patch.yml",
+    "locale",
     "README.md",
     "tools/history-evidence.mjs",
     "tests/provider.test.mjs"

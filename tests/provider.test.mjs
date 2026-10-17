@@ -4,10 +4,13 @@
  *
  *   node --test tests/provider.test.mjs
  *
- * Covers the acceptance rules the hook port must enforce (date from createdAt in
- * Asia/Shanghai, the ten types, full-width separator, topic budget, strict JSON,
- * project-name exclusion), the first-turn trigger's skip conditions, the admin
- * tool's write path, and whole-conversation summarization.
+ * The plugin now owns the single session-title provider slot, so the tests drive
+ * `provider.generate()` exactly as the official service does and check the
+ * provider contract (a valid title plus `messageSeqs`), the acceptance rules the
+ * hook port must enforce (date from createdAt in Asia/Shanghai, the ten types,
+ * full-width separator, topic budget, strict JSON, project-name exclusion), the
+ * deterministic placeholder used when no model title is available, the one-shot
+ * correction of that placeholder, the conflict behaviour, and the admin tool.
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -52,12 +55,14 @@ function buildLog(turns, { title } = {}) {
 }
 
 const FIRST_TURN = [{ prompt: '请修复登录报错', assistant: '已修复并验证通过', tools: ['pwsh'] }]
+/** The placeholder a session gets before its first turn has produced anything. */
+const PLACEHOLDER = `1002${SEP}探索${SEP}请修复登录报错`
 
 /** Build one live-session stand-in backed by a fixed event log. */
-function fakeSession({ createdAt, cwd = 'D:\\__CODE__\\demo', log = buildLog(FIRST_TURN) } = {}) {
+function fakeSession({ id = 'session-test', createdAt, cwd = 'D:\\__CODE__\\demo', log = buildLog(FIRST_TURN), header } = {}) {
   return {
-    id: 'session-test',
-    header: { id: 'session-test', createdAt, cwd },
+    id,
+    header: header ?? { id, createdAt, cwd },
     snapshotEvents: () => log,
   }
 }
@@ -65,7 +70,7 @@ function fakeSession({ createdAt, cwd = 'D:\\__CODE__\\demo', log = buildLog(FIR
 /**
  * Build the fake host context.
  * @param reply - the raw text the fake model streams back.
- * @param currentTitle - the title the session already carries, if any.
+ * @param conflict - when set, `register` throws with this message.
  */
 function fakeContext({
   reply = `{"title":"1002${SEP}功能${SEP}演示主题"}`,
@@ -73,9 +78,11 @@ function fakeContext({
   sessions = [],
   query,
   controller,
+  conflict,
+  failStream = false,
   timer = { timeout: (callback) => { queueMicrotask(callback); return () => {} } },
 } = {}) {
-  const captured = { renames: [], listeners: {} }
+  const captured = { renames: [], refreshes: [], listeners: {} }
   const ctx = {
     get: (key) => {
       if (key === 'sessions') return { get: (id) => sessions.find((s) => s.id === id) }
@@ -94,6 +101,15 @@ function fakeContext({
     },
     logger: { warn: () => {} },
     sessionTitle: {
+      register: (provider) => {
+        if (conflict !== undefined) throw new Error(conflict)
+        captured.provider = provider
+        return () => {}
+      },
+      refresh: async (session) => {
+        captured.refreshes.push(session)
+        return { title: 'refreshed', eventSeq: 2 }
+      },
       rename: (session, title) => {
         captured.renames.push({ session, title })
         return { title, eventSeq: 1 }
@@ -104,7 +120,10 @@ function fakeContext({
         captured.request = options
         const chunks = [{ type: 'text-delta', index: 0, text: reply }, { type: 'finish', reason: { kind: finish } }]
         return (async function* () {
-          for (const chunk of chunks) yield chunk
+          for (const chunk of chunks) {
+            if (failStream) throw new Error('stream failed')
+            yield chunk
+          }
         })()
       },
     },
@@ -119,97 +138,86 @@ function fakeContext({
 }
 
 /**
- * Drive one automatic naming attempt and report what it wrote.
- * @param overrides.triggerTurn - the turn whose `turn/end` fires the trigger.
+ * Drive one provider generation and report what it returned.
+ * @param overrides.messages - the eligible human messages the service passes in.
  */
 async function runAuto(options, overrides = {}) {
   const session =
     overrides.session ?? fakeSession({ createdAt: overrides.createdAt ?? Date.UTC(2026, 9, 2, 1, 0, 0) })
-  // A live trigger always has its session in the live store; that is what makes
-  // the write go through `sessionTitle.rename` instead of a resume.
   const { ctx, captured } = fakeContext({ ...options, sessions: [session] })
   apply(ctx)
-  captured.listeners['session/event'](session, {
-    type: 'turn/end',
-    data: { turn: overrides.triggerTurn ?? 1, reason: { kind: 'completed' } },
-    seq: 999,
+  const messages = overrides.messages ?? [{ seq: 3, text: '请修复登录报错' }]
+  const result = await captured.provider.generate({
+    session,
+    messages,
+    route: { provider: 'p', model: 'm' },
+    signal: overrides.signal ?? new AbortController().signal,
   })
-  await sleep(30)
-  return {
-    renamed: captured.renames.length > 0,
-    title: captured.renames[0]?.title,
-    captured,
-  }
+  return { result, title: result.title, captured, ctx, session }
 }
 
-test('applies without a timer service, losing only the catch-up', async () => {
-  // The naming trigger and the admin tool must never depend on the optional
-  // catch-up being schedulable.
-  const { ctx, captured } = fakeContext({
-    timer: null,
-    query: { listSessions: async () => [], readTitleSnapshots: async () => [] },
-  })
-  apply(ctx)
-  assert.equal(typeof captured.listeners['session/event'], 'function')
-  assert.equal(captured.tool.name, 'session_title_admin')
-  const listed = await captured.tool.execute({ action: 'list' })
-  assert.ok(
-    listed.auto.recent.some((entry) => entry.outcome === 'sweep' && /timer service unavailable/.test(entry.detail)),
-    'the skipped catch-up must say why',
-  )
-})
-
-test('plugin surface: name, inject, first-turn trigger, and one admin tool', () => {
+test('plugin surface: name, inject, the provider slot, and one admin tool', () => {
   const { ctx, captured } = fakeContext({})
   apply(ctx)
   assert.equal(name, 'dsh-session-autoname')
   assert.deepEqual(inject, ['sessionTitle', 'llm', 'tools'])
+  assert.equal(captured.provider.id, 'session-autoname')
+  assert.equal(captured.provider.automatic, 'all-prompts')
+  assert.equal(typeof captured.provider.generate, 'function')
   assert.equal(typeof captured.listeners['session/event'], 'function')
   assert.equal(captured.tool.name, 'session_title_admin')
 })
 
-test('names a root session once its first turn closes, rebuilding the canonical title', async () => {
-  const result = await runAuto({ reply: `{"title":"1002${SEP}修复${SEP}登录报错处理"}` })
-  assert.equal(result.renamed, true)
-  assert.equal(result.title, `1002${SEP}修复${SEP}登录报错处理`)
+test('a taken provider slot refuses to activate instead of idling', () => {
+  // A row that shows "running" but never writes a title is exactly the silent
+  // no-op the plugin must not create; a failed entry is visible on the plugin page.
+  const { ctx } = fakeContext({ conflict: 'session-title provider "x" is already registered' })
+  assert.throws(() => apply(ctx), /already taken[\s\S]*exactly ONE/)
+})
+
+test('names a root session from its completed work, rebuilding the canonical title', async () => {
+  const { title, result, captured } = await runAuto({ reply: `{"title":"1002${SEP}修复${SEP}登录报错处理"}` })
+  assert.equal(title, `1002${SEP}修复${SEP}登录报错处理`)
+  // The provider contract: a title plus the seqs of the messages it was built from.
+  assert.deepEqual(result.messageSeqs, [3])
+  assert.deepEqual(result.model, { provider: 'p', model: 'm' })
   // The auxiliary call is marked so no title path can re-trigger itself.
-  assert.equal(result.captured.request.purpose, 'session-title')
-  assert.equal(result.captured.request.sessionId, 'session-test')
+  assert.equal(captured.request.purpose, 'session-title')
+  assert.equal(captured.request.sessionId, 'session-test')
 })
 
 test('date comes from createdAt in Asia/Shanghai, across the UTC day boundary', async () => {
   // 2026-09-30T16:30Z is 2026-10-01 00:30 in Asia/Shanghai.
   const createdAt = Date.UTC(2026, 8, 30, 16, 30, 0)
   const rejected = await runAuto({ reply: `{"title":"0930${SEP}修复${SEP}登录报错处理"}` }, { createdAt })
-  assert.equal(rejected.renamed, false)
+  assert.equal(rejected.title, `1001${SEP}探索${SEP}请修复登录报错`)
   const accepted = await runAuto({ reply: `{"title":"1001${SEP}修复${SEP}登录报错处理"}` }, { createdAt })
-  assert.equal(accepted.renamed, true)
   assert.equal(accepted.title, `1001${SEP}修复${SEP}登录报错处理`)
 })
 
-test('rejects an illegal type, a half-width separator, and a missing separator', async () => {
+test('falls back on an illegal type, a half-width separator, and a missing separator', async () => {
   for (const reply of [
     `{"title":"1002${SEP}重构${SEP}登录报错处理"}`,
     `{"title":"1002|修复|登录报错处理"}`,
     `{"title":"1002${SEP}登录报错处理"}`,
   ]) {
-    const result = await runAuto({ reply })
-    assert.equal(result.renamed, false, `expected rejection for ${reply}`)
+    const { title } = await runAuto({ reply })
+    assert.equal(title, PLACEHOLDER, `expected the placeholder for ${reply}`)
   }
 })
 
-test('rejects an empty topic, an over-long topic, and a repeated project name', async () => {
+test('falls back on an empty topic, an over-long topic, and a repeated project name', async () => {
   for (const reply of [
     `{"title":"1002${SEP}修复${SEP}   "}`,
     `{"title":"1002${SEP}修复${SEP}${'很长的主题'.repeat(8)}"}`,
     `{"title":"1002${SEP}修复${SEP}demo 项目登录报错处理"}`,
   ]) {
-    const result = await runAuto({ reply })
-    assert.equal(result.renamed, false, `expected rejection for ${reply}`)
+    const { title } = await runAuto({ reply })
+    assert.equal(title, PLACEHOLDER, `expected the placeholder for ${reply}`)
   }
 })
 
-test('rejects Markdown, extra fields, non-JSON prose, and a declined title', async () => {
+test('falls back on Markdown, extra fields, non-JSON prose, and a declined title', async () => {
   for (const reply of [
     '```json\n{"title":"1002' + SEP + '修复' + SEP + '登录报错处理"}\n```',
     `{"title":"1002${SEP}修复${SEP}登录报错处理","reason":"x"}`,
@@ -217,51 +225,30 @@ test('rejects Markdown, extra fields, non-JSON prose, and a declined title', asy
     '{"title":null}',
     '',
   ]) {
-    const result = await runAuto({ reply })
-    assert.equal(result.renamed, false, `expected rejection for ${JSON.stringify(reply)}`)
+    const { title } = await runAuto({ reply })
+    assert.equal(title, PLACEHOLDER, `expected the placeholder for ${JSON.stringify(reply)}`)
   }
 })
 
-test('accepts complete JSON from a max-tokens finish, rejects a truncated one', async () => {
+test('accepts complete JSON from a max-tokens finish, falls back on a truncated one', async () => {
   // A reasoning route can exhaust the output budget before the model stops; the
   // text it did emit is still usable when it parses and validates.
   const complete = await runAuto({
     reply: `{"title":"1002${SEP}文档${SEP}预算耗尽但完整"}`,
     finish: 'max-tokens',
   })
-  assert.equal(complete.renamed, true)
   assert.equal(complete.title, `1002${SEP}文档${SEP}预算耗尽但完整`)
   const truncated = await runAuto({ reply: `{"title":"1002${SEP}文档${SEP}被截断`, finish: 'max-tokens' })
-  assert.equal(truncated.renamed, false)
+  assert.equal(truncated.title, PLACEHOLDER)
   // A terminal reason that is not "stop" or "max-tokens" stays a failure.
-  const errored = await runAuto({ reply: `{"title":"1002${SEP}文档${SEP}报错"}` , finish: 'error' })
-  assert.equal(errored.renamed, false)
+  const errored = await runAuto({ reply: `{"title":"1002${SEP}文档${SEP}报错"}`, finish: 'error' })
+  assert.equal(errored.title, PLACEHOLDER)
 })
 
-test('skips a title the human already chose, but replaces another provider\'s plain text', async () => {
-  const created = Date.UTC(2026, 9, 2, 1, 0, 0)
-  const withTitle = (title, source) =>
-    fakeSession({ createdAt: created, log: buildLog(FIRST_TURN, { title: { title, source } }) })
-  const chosen = await runAuto({}, { session: withTitle('既有标题', { kind: 'user' }) })
-  assert.equal(chosen.renamed, false)
-  assert.equal(chosen.captured.request, undefined)
-  // The stock first-prompt provider writes plain text while the turn runs; that
-  // is not a reason to keep a non-compliant title.
-  const stock = await runAuto({}, { session: withTitle('PowerShell 含义说明', { kind: 'provider' }) })
-  assert.equal(stock.renamed, true)
-  const compliant = await runAuto(
-    {},
-    { session: withTitle(`1002${SEP}修复${SEP}已合规标题`, { kind: 'provider' }) },
-  )
-  assert.equal(compliant.renamed, false)
-  const fallback = await runAuto({}, { session: withTitle('请修复登录报错', { kind: 'fallback' }) })
-  assert.equal(fallback.renamed, true)
-})
-
-test('names an interrupted first turn from the whole conversation, skips one with no work', async () => {
+test('names an interrupted first turn from the whole conversation', async () => {
   // A crash or an interrupt leaves turn 1 without a "completed" end; the session
   // must still be nameable, from whatever the conversation actually holds.
-  const aborted = await runAuto(
+  const { title, captured } = await runAuto(
     {},
     {
       session: fakeSession({
@@ -270,31 +257,118 @@ test('names an interrupted first turn from the whole conversation, skips one wit
       }),
     },
   )
-  assert.equal(aborted.renamed, true)
-  assert.match(aborted.captured.request.messages[0].content[0].text, /whole_conversation/)
-  const empty = await runAuto(
-    {},
-    { session: fakeSession({ createdAt: Date.UTC(2026, 9, 2, 1, 0, 0), log: buildLog([{ prompt: '改一下' }]) }) },
-  )
-  assert.equal(empty.renamed, false)
+  assert.equal(title, `1002${SEP}功能${SEP}演示主题`)
+  assert.match(captured.request.messages[0].content[0].text, /whole_conversation/)
 })
 
-test('names at a later turn end when the first turn never closed', async () => {
-  const log = buildLog([
-    // `end: 'open'` is exactly how a log killed mid-turn looks after a restart.
+test('a turn with no assistant work yet becomes a placeholder and asks for a correction', async () => {
+  const { title, captured, ctx, session } = await runAuto(
+    {},
+    {
+      session: fakeSession({
+        createdAt: Date.UTC(2026, 9, 2, 1, 0, 0),
+        log: buildLog([{ prompt: '请修复登录报错', end: 'open' }]),
+      }),
+    },
+  )
+  assert.equal(title, PLACEHOLDER)
+  assert.equal(captured.request, undefined, 'no model call without evidence to classify')
+  // The provider is called again through the service once the turn produced work.
+  captured.listeners['session/event'](session, {
+    type: 'turn/end',
+    data: { turn: 1, reason: { kind: 'completed' } },
+    seq: 999,
+  })
+  await sleep(10)
+  assert.equal(captured.refreshes.length, 1)
+  assert.equal(captured.renames.length, 0, 'a refresh keeps the title a provider title')
+})
+
+test('a later turn reads the whole conversation and carries the current title', async () => {
+  const turns = [
     { prompt: '先说需求', assistant: '部分进展', end: 'open' },
     { prompt: '继续', assistant: '最终交付：改完并验证通过', tools: ['pwsh'] },
-  ])
-  const result = await runAuto(
+  ]
+  const log = buildLog(turns)
+  const withTitle = buildLog(turns, {
+    title: { title: `1002${SEP}修复${SEP}崩溃后继续完成`, source: { kind: 'provider' } },
+  })
+  const { title, captured } = await runAuto(
     { reply: `{"title":"1002${SEP}修复${SEP}崩溃后继续完成"}` },
-    { session: fakeSession({ createdAt: Date.UTC(2026, 9, 2, 1, 0, 0), log }), triggerTurn: 2 },
+    { session: fakeSession({ createdAt: Date.UTC(2026, 9, 2, 1, 0, 0), log: withTitle }) },
   )
-  assert.equal(result.renamed, true)
-  assert.equal(result.title, `1002${SEP}修复${SEP}崩溃后继续完成`)
-  assert.match(result.captured.request.messages[0].content[0].text, /whole_conversation/)
+  assert.equal(title, `1002${SEP}修复${SEP}崩溃后继续完成`)
+  const framed = captured.request.messages[0].content[0].text
+  assert.match(framed, /whole_conversation/)
+  assert.match(framed, /最终交付/)
+  assert.match(framed, /崩溃后继续完成/)
+  // A log of the same shape without a title is still namable.
+  const plain = await runAuto(
+    { reply: `{"title":"1002${SEP}修复${SEP}崩溃后继续完成"}` },
+    { session: fakeSession({ createdAt: Date.UTC(2026, 9, 2, 1, 0, 0), log }) },
+  )
+  assert.equal(plain.title, `1002${SEP}修复${SEP}崩溃后继续完成`)
 })
 
-test('catch-up sweep names a recent session whose first turn never closed', async () => {
+test('a title generated from evidence is not corrected again at the turn end', async () => {
+  // The correction exists only for the placeholder; a real title must not cost a
+  // second model call at the end of every first turn.
+  const session = fakeSession({ id: 'session-clean', createdAt: Date.UTC(2026, 9, 2, 1, 0, 0) })
+  const { captured, title } = await runAuto({}, { session })
+  assert.equal(title, `1002${SEP}功能${SEP}演示主题`)
+  captured.listeners['session/event'](session, {
+    type: 'turn/end',
+    data: { turn: 1, reason: { kind: 'completed' } },
+    seq: 999,
+  })
+  await sleep(10)
+  assert.equal(captured.refreshes.length, 0)
+})
+
+test('the placeholder is never overwritten once the human pinned the title', async () => {
+  const log = buildLog(
+    [{ prompt: '请修复登录报错', end: 'open' }],
+    { title: { title: '我的手写标题', source: { kind: 'user' } } },
+  )
+  const { captured, session } = await runAuto(
+    {},
+    { session: fakeSession({ createdAt: Date.UTC(2026, 9, 2, 1, 0, 0), log }) },
+  )
+  captured.listeners['session/event'](session, {
+    type: 'turn/end',
+    data: { turn: 1, reason: { kind: 'completed' } },
+    seq: 999,
+  })
+  await sleep(10)
+  assert.equal(captured.refreshes.length, 0, 'a user rename pins the title')
+})
+
+test('a subagent session gets a deterministic placeholder without a model call', async () => {
+  const session = fakeSession({
+    createdAt: Date.UTC(2026, 9, 2, 1, 0, 0),
+    header: { id: 'session-test', createdAt: Date.UTC(2026, 9, 2, 1, 0, 0), cwd: 'D:\\x', parentSession: 'root' },
+  })
+  const { title, captured, result } = await runAuto({}, { session })
+  assert.equal(title, PLACEHOLDER)
+  assert.deepEqual(result.messageSeqs, [3])
+  assert.equal(captured.request, undefined)
+})
+
+test('an aborted generation rethrows so the service records nothing', async () => {
+  // The service silences an aborted generation; swallowing the abort here would
+  // instead write a placeholder over a title that is about to be regenerated.
+  const session = fakeSession({ createdAt: Date.UTC(2026, 9, 2, 1, 0, 0) })
+  const { ctx, captured } = fakeContext({ failStream: true })
+  apply(ctx)
+  const aborted = new AbortController()
+  aborted.abort()
+  await assert.rejects(
+    captured.provider.generate({ session, messages: [{ seq: 1, text: 'x' }], signal: aborted.signal }),
+    /stream failed/,
+  )
+})
+
+test('catch-up sweep refreshes a recent session the schedule cannot reach', async () => {
   const createdAt = Date.now() - 60 * 60 * 1000
   const mmdd = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'Asia/Shanghai',
@@ -305,7 +379,6 @@ test('catch-up sweep names a recent session whose first turn never closed', asyn
     .replace('-', '')
   const header = { id: 'session-crash', createdAt, cwd: 'C:\\Users\\demo' }
   const log = buildLog([{ prompt: '崩在半路', assistant: '已完成的部分结论', end: 'open' }])
-  const writes = []
   const query = {
     listSessions: async () => [{ header, live: false, persisted: true }],
     readTitleSnapshots: async () => [
@@ -317,24 +390,24 @@ test('catch-up sweep names a recent session whose first turn never closed', asyn
     query,
     reply: `{"title":"${mmdd}${SEP}诊断${SEP}崩溃中断补偿命名"}`,
     controller: {
+      resolveAgent: async () => ({ agent: { session: { id: 'session-crash', header } } }),
       rename: async (request) => {
-        writes.push(request)
-        return { title: request.title, seq: 3 }
+        throw new Error(`the sweep must refresh, not rename (${request.title})`)
       },
     },
   })
   apply(ctx)
   await sleep(60)
-  assert.equal(writes.length, 1)
-  assert.equal(writes[0].title, `${mmdd}${SEP}诊断${SEP}崩溃中断补偿命名`)
   const listed = await captured.tool.execute({ action: 'list' })
+  assert.equal(captured.refreshes.length, 1)
+  assert.equal(captured.renames.length, 0, 'a refresh keeps the title a provider title')
   assert.ok(
     listed.auto.recent.some((entry) => entry.outcome === 'sweep' && /named 1/.test(entry.detail)),
-    'the sweep must report what it named',
+    'the sweep must report what it refreshed',
   )
 })
 
-test('admin tool: list reports automatic outcomes, apply keeps the date rule and the write path', async () => {
+test('admin tool: list reports the provider, apply keeps the date rule and the write path', async () => {
   const header = { id: 'session-a', createdAt: Date.UTC(2026, 8, 20, 1, 0, 0), cwd: 'D:\\__CODE__\\demo' }
   const cold = { id: 'session-b', createdAt: Date.UTC(2026, 8, 21, 1, 0, 0), cwd: 'D:\\__CODE__\\demo' }
   const live_session = { id: 'session-a', header, snapshotEvents: () => [] }
@@ -354,6 +427,7 @@ test('admin tool: list reports automatic outcomes, apply keeps the date rule and
   const { ctx, captured } = fakeContext({
     sessions: [live_session],
     query,
+    timer: null,
     controller: {
       rename: async (request) => {
         renamed.push(request)
@@ -366,7 +440,8 @@ test('admin tool: list reports automatic outcomes, apply keeps the date rule and
 
   const listed = await tool.execute({ action: 'list' })
   assert.equal(listed.count, 2)
-  assert.equal(listed.auto.trigger, 'session/event turn/end (any turn)')
+  assert.deepEqual(listed.auto.provider, { id: 'session-autoname', automatic: 'all-prompts' })
+  assert.match(listed.auto.trigger, /official schedule/)
   assert.equal(typeof listed.auto.catch_up.window_ms, 'number')
   // Newest first: the cold 0921 session precedes the live 0920 one.
   assert.equal(listed.items[0].mmdd, '0921')
@@ -406,7 +481,7 @@ test('admin tool: summarize names a specified conversation from its whole conten
     readSession: async () => ({ session: header, events: log }),
     readTitleSnapshot: async () => ({ session: header }),
   }
-  const { ctx, captured } = fakeContext({ query, reply: `{"title":"0924${SEP}修复${SEP}配置改动与验证"}` })
+  const { ctx, captured } = fakeContext({ query, timer: null, reply: `{"title":"0924${SEP}修复${SEP}配置改动与验证"}` })
   apply(ctx)
   const tool = captured.tool
   // A cold session has no live store entry, so the write goes through the controller.
@@ -445,7 +520,7 @@ test('admin tool: summarize refuses a title whose date is not the session create
     readTitleSnapshot: async () => ({ session: header }),
   }
   const writes = []
-  const { ctx, captured } = fakeContext({ query, reply: `{"title":"0101${SEP}修复${SEP}错误日期"}` })
+  const { ctx, captured } = fakeContext({ query, timer: null, reply: `{"title":"0101${SEP}修复${SEP}错误日期"}` })
   apply(ctx)
   ctx.get = (key) =>
     key === 'sessionQuery'

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Automatic session names",
+    "description": "Names sessions as MMDD｜type｜topic from the whole turn and keeps updating them as the conversation grows. Use it INSTEAD OF the official Conversation-following titles plugin: both claim the one title-provider slot, the first to load wins, and the other shows a failed entry."
+  }
+}

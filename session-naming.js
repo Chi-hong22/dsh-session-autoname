@@ -1,30 +1,33 @@
 /**
  * dsh-session-autoname — host half.
  *
- * Port of a Codex `Stop`-hook session-renaming setup onto DeepSeek Harness.
- * DSH has no hooks.json and no `Stop` handler; the closest turn-lifecycle point
- * is the durable `turn/end` event, and the supported way to write a title is the
- * `ctx.sessionTitle` service.
+ * Port of a Codex `Stop`-hook session-renaming setup onto DeepSeek Harness, wired
+ * into the official session-title pipeline: this plugin REGISTERS the one
+ * session-title provider slot with `automatic: 'all-prompts'`, and its bundle
+ * patch disables the stock first-prompt provider so the slot is free.
  *
- * Why this plugin does NOT register a title provider: `sessionTitle.register()`
- * accepts exactly ONE provider, so the stock
- * `@deepseek-ai/dsh-session-title-first-prompt-llm` would have to be disabled
- * first. Instead this plugin never competes for that slot:
+ * What taking the slot buys, and what it costs:
  *
- * - It listens for `session/event` `turn/end` of turn 1 on a root session, then
- *   classifies from the user request plus the work the assistant actually
- *   completed in that turn.
- * - It writes through `sessionTitle.rename()`, which is the interface the GUI
- *   itself uses and which also SUPERSEDES any in-flight or pending automatic
- *   generation for that session (`supersede()` aborts the active controller and
- *   bumps the revision), so the stock provider can stay enabled: whatever plain
- *   text it writes is replaced by this plugin's `MMDD｜类型｜主题` title, and a
- *   user-source title pins the session against later automatic revisions.
+ * - The harness decides WHEN a title is regenerated: on every eligible human
+ *   message of a session, at that turn's first main request. This plugin only
+ *   supplies the generation — it classifies from the session's own log (the human
+ *   requests plus the work the assistant actually completed) and returns
+ *   `MMDD｜类型｜主题`.
+ * - The service owns validation, the `messageSeqs` contract and persistence, and
+ *   everything written is a provider-source title, so later turns keep updating
+ *   it instead of pinning it.
+ * - The service schedules BEFORE the turn runs, so a session's first title has no
+ *   assistant work to classify yet. That one is a `探索` placeholder, refreshed
+ *   once when the turn ends; after that the schedule alone is enough.
+ * - A user rename still pins the title: the service schedules nothing for a
+ *   user-source title, and the placeholder correction skips it too.
  *
- * Deliberate difference from the Codex hook: DSH streams the assistant answer to
- * the browser while the turn runs, so no server-side hook can set a title
- * "before the answer is delivered". This plugin names the session at the same
- * point in the turn lifecycle the Codex `Stop` hook read, without delaying it.
+ * The official "随对话更新的标题" bundle competes for the same single slot. When
+ * this plugin finds the slot taken it refuses to activate and says why: a host
+ * plugin that shows "running" while never writing a title is a silent no-op, and
+ * any title written from here would pin the session against the provider that
+ * owns it. The bundle patch already disables the stock provider, so only an
+ * explicitly enabled experimental bundle can cause that.
  *
  * The same generation core also powers `session_title_admin`'s `summarize`
  * action, which names ONE specified conversation from its whole content.
@@ -58,6 +61,8 @@ const TIME_ZONE = 'Asia/Shanghai'
 const MAX_TITLE_BYTES = 76
 const MAX_TOPIC_CHARS = 24
 const MAX_TOPIC_BYTES = 60
+/** Topic length of the deterministic placeholder title. */
+const FALLBACK_TOPIC_CHARS = 12
 
 /** Timeout of one auxiliary title model call. */
 const LLM_TIMEOUT_MS = 90 * 1000
@@ -95,8 +100,12 @@ const SELFTEST_TIMEOUT_MS = 8 * 60 * 1000
 /** How many automatic-naming outcomes the admin tool keeps for inspection. */
 const RECENT_LIMIT = 10
 
-/** Sessions whose titling is currently being attempted. */
-const in_flight = new Set()
+/**
+ * Sessions whose current title was generated without any completed assistant
+ * work to classify — the turn it belongs to had not run yet — so it needs one
+ * refresh once that turn ends.
+ */
+const pending_evidence = new Set()
 /** Newest-first ring of automatic-naming outcomes, for the admin tool. */
 const recent = []
 
@@ -138,6 +147,8 @@ const SYSTEM_PROMPT = [
   '    取对话最终的落点而不是其中某一轮的中间状态。',
   '11. 若某轮的 end 不是 completed（interrupted/aborted/error/max-tokens/open），说明该轮被中断：',
   '    只能依据其已完成的部分判定，且类型要保守（倾向 诊断 或 探索），不得写成已完成的结果。',
+  '12. 数据中的 current_title 是本插件上一次写下的标题（可能为 null）。若它仍然准确描述当前的主要任务，',
+  '    就逐字返回它，不要改写或润色；只有主要任务真的改变时才更换类型或主题；同一任务继续推进时保留原类型与主措辞。',
 ].join('\n')
 
 /** `MMDD` in Asia/Shanghai for one epoch-millisecond instant. */
@@ -514,82 +525,167 @@ function routeOf(ctx, header, events) {
 // ---------------------------------------------------------------------------
 
 /**
- * Name one root session from its own log, whichever way it was reached.
- *
- * The digest follows the evidence: turn 1's own completed result when there is
- * one, otherwise the whole conversation so far — which is what makes a session
- * whose first turn was lost to a crash still nameable.
- *
- * @returns `{ outcome, detail }` with outcome `untouched` (nothing to do, so the
- * caller records nothing), `skipped` (no usable evidence), or `named`; a real
- * failure propagates to the caller.
+ * Deterministic placeholder title: the first line of the session's first prompt,
+ * re-validated through the same rules as a model title so a fallback can never
+ * break the format. Used when the model produced nothing usable, and for a turn
+ * that has no completed work to classify yet.
  */
-async function nameSession(ctx, { session_id, header, events }) {
-  if (!isRootSession(header)) return { outcome: 'untouched', detail: 'not a root session' }
-  if (in_flight.has(session_id)) return { outcome: 'untouched', detail: 'already in flight' }
-  const mmdd = mmddOf(header.createdAt)
-  // Skip only when the human already chose the title, or when the title is
-  // already in this plugin's format. Another provider's plain text (the stock
-  // first-prompt provider runs while the turn is still going) is not a final title.
-  const state = titleStateOf(events)
-  if (state !== undefined && (state.source?.kind === 'user' || isCompliantTitle(state.title, mmdd))) {
-    return { outcome: 'untouched', detail: `already titled: ${state.source?.kind ?? 'unknown'}` }
-  }
-  in_flight.add(session_id)
-  try {
-    const projects = await projectNamesOf(ctx, header)
-    const folds = foldTurns(events)
-    let data
+function fallbackTitleOf(mmdd, prompt, projects) {
+  const line = String(prompt ?? '')
+    .split(/[\r\n]/u)[0]
+    .replace(/[｜|]/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim()
+  const head = [...line].slice(0, FALLBACK_TOPIC_CHARS).join('').trim()
+  for (const topic of [head, '会话记录']) {
+    if (topic.length === 0) continue
     try {
-      data = digestOf(folds, mmdd, projects)
-    } catch (error) {
-      return { outcome: 'skipped', detail: error instanceof Error ? error.message : String(error) }
+      return acceptTitle(JSON.stringify({ title: `${mmdd}${SEPARATOR}探索${SEPARATOR}${topic}` }), {
+        mmdd,
+        projects,
+      })
+    } catch {
+      // The next candidate is shorter and cannot repeat the project name.
     }
-    const title = await generateTitle(ctx, {
-      route: routeOf(ctx, header, events),
-      session_id,
-      data,
-      mmdd,
-      projects,
-    })
-    const written = await writeTitle(ctx, session_id, title, header)
-    return { outcome: 'named', detail: written.title, scope: data.scope }
-  } finally {
-    in_flight.delete(session_id)
   }
+  return `${mmdd}${SEPARATOR}探索${SEPARATOR}会话记录`
 }
 
-/** Trigger path: one turn of a live root session closed. */
-async function autoName(ctx, session) {
+/**
+ * One provider generation, exactly as the title service calls it.
+ *
+ * `messages` are the eligible human messages the service collected; the session
+ * itself is live, so the digest also reads the assistant work, the tool calls and
+ * the previous title. The service decides when this runs.
+ *
+ * Everything except an abort returns a valid result: a model failure and a turn
+ * with nothing to classify yet both fall back to the deterministic placeholder,
+ * because a failed generation must never leave the session with no compliant
+ * title at all. An abort rethrows so the service records nothing.
+ */
+async function generateSessionTitle(ctx, request) {
+  const { session, messages, signal } = request
+  const header = session.header
   const session_id = session.id
+  const message_seqs = messages.map((message) => message.seq)
+  const mmdd = mmddOf(header.createdAt)
+  const projects = await projectNamesOf(ctx, header)
+  const placeholder = () => fallbackTitleOf(mmdd, messages[0]?.text ?? '', projects)
+  // Subagent runs are not conversations a person reads; naming them from their
+  // own first prompt keeps the sidebar format uniform without a model call.
+  if (!isRootSession(header)) return { title: placeholder(), messageSeqs: message_seqs }
+  const events = session.snapshotEvents()
+  const state = titleStateOf(events)
+  const current_title =
+    state?.source?.kind === 'provider' && isCompliantTitle(state.title, mmdd) ? state.title : null
+  let data
   try {
-    const result = await nameSession(ctx, {
-      session_id,
-      header: session.header,
-      events: session.snapshotEvents(),
-    })
-    if (result.outcome !== 'untouched') remember({ session_id, ...result })
+    const folds = foldTurns(events)
+    // Once a session has more than its first turn, the whole conversation is the
+    // evidence, so a changed main task can change the type; `current_title` is
+    // what keeps an unchanged one verbatim.
+    const digest =
+      folds.turns.length > 1 ? conversationData(folds, mmdd, projects) : digestOf(folds, mmdd, projects)
+    data = { ...digest, current_title }
   } catch (error) {
+    // Nothing to classify yet: the service schedules at the turn's first main
+    // request, before the assistant has produced anything. The turn-end
+    // correction replaces this placeholder.
+    pending_evidence.add(session_id)
+    remember({
+      session_id,
+      outcome: 'placeholder',
+      detail: error instanceof Error ? error.message : String(error),
+    })
+    return { title: placeholder(), messageSeqs: message_seqs }
+  }
+  try {
+    const route = request.route ?? routeOf(ctx, header, events)
+    const title = await generateTitle(ctx, { route, session_id, data, mmdd, projects, signal })
+    pending_evidence.delete(session_id)
+    remember({ session_id, outcome: 'named', detail: title, scope: data.scope })
+    return { title, messageSeqs: message_seqs, model: route }
+  } catch (error) {
+    if (signal?.aborted === true) throw error
     const detail = error instanceof Error ? error.message : String(error)
+    pending_evidence.add(session_id)
     remember({ session_id, outcome: 'failed', detail })
     ctx.logger?.warn?.(`session-autoname: ${session_id}: ${detail}`)
+    return { title: placeholder(), messageSeqs: message_seqs }
   }
 }
 
 /**
- * Catch-up sweep for everything a live event could not cover: a crash mid-turn
- * leaves the first turn with no `turn/end` at all, and on the next start that turn
- * is restored as an open turn that can never end as `completed`.
+ * Claim the single title-provider slot.
  *
- * Runs once, a few seconds after this plugin applies: name every recent root
- * session that still carries no compliant title. Older sessions are deliberately
- * out of scope — the turn trigger reaches them when they are continued, and the
- * `summarize` action reaches them on request.
+ * `sessionTitle.register()` accepts exactly ONE provider. The stock first-prompt
+ * provider is disabled by this bundle's patch, so a conflict here means another
+ * plugin (the official experimental conversation-following bundle) already owns
+ * the slot. Fail loudly instead of registering nothing: a host plugin has no
+ * toast channel, so a row that shows "running" while never writing a title is the
+ * exact silent no-op this plugin must never create. A failed entry shows the
+ * "异常" phase on the plugin page and one startup warning line.
+ */
+function claimProviderSlot(ctx) {
+  const provider = {
+    id: PROVIDER_ID,
+    automatic: 'all-prompts',
+    generate: (request) => generateSessionTitle(ctx, request),
+  }
+  let dispose
+  try {
+    dispose = ctx.sessionTitle.register(provider)
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    throw new Error(
+      'session-autoname: the single session-title provider slot is already taken, so this plugin ' +
+        `cannot name anything (${detail}). Keep exactly ONE of this plugin and the official ` +
+        '"随对话更新的标题" (@deepseek-ai/dsh-experimental-session-titles-bundle) enabled, then restart.',
+    )
+  }
+  ctx.effect(() => () => void dispose(), 'session-autoname: title provider')
+}
+
+/**
+ * One-shot correction of a session whose only title is the placeholder: now that
+ * the turn has produced work, ask the provider again through
+ * `sessionTitle.refresh`, so the title stays a provider title and later turns keep
+ * updating it. Skipped when the human pinned the title in the meantime.
+ */
+function correctPlaceholderTitle(ctx, session) {
+  if (!pending_evidence.has(session.id)) return
+  const state = titleStateOf(session.snapshotEvents())
+  if (state?.source?.kind === 'user') {
+    pending_evidence.delete(session.id)
+    return
+  }
+  void ctx.sessionTitle.refresh(session).catch((error) => {
+    const detail = error instanceof Error ? error.message : String(error)
+    remember({ session_id: session.id, outcome: 'failed', detail: `refresh: ${detail}` })
+    ctx.logger?.warn?.(`session-autoname: ${session.id}: placeholder refresh failed: ${detail}`)
+  })
+}
+
+/**
+ * Catch-up sweep for sessions the provider schedule can no longer reach: the
+ * service only schedules on a NEW human message, so a session whose last message
+ * predates this plugin keeps its old title until it is continued.
+ *
+ * Runs once, a few seconds after this plugin applies: refresh every recent root
+ * session that still carries no compliant title. `refresh` keeps the title a
+ * provider title, so the schedule keeps updating it later; a rename would pin it.
+ * Older sessions are deliberately out of scope — the schedule reaches them when
+ * they are continued, and the `summarize` action reaches them on request.
  */
 async function sweep(ctx) {
   const query = ctx.get('sessionQuery')
   if (query === undefined) {
     remember({ outcome: 'sweep', detail: 'sessionQuery unavailable; catch-up skipped' })
+    return
+  }
+  const controller = ctx.get('sessionController')
+  if (controller === undefined) {
+    remember({ outcome: 'sweep', detail: 'sessionController unavailable; catch-up skipped' })
     return
   }
   const since = Date.now() - CATCHUP_WINDOW_MS
@@ -615,17 +711,17 @@ async function sweep(ctx) {
     if (named >= CATCHUP_MAX) break
     try {
       const snapshot = await query.readSession(session_id)
-      const result = await nameSession(ctx, {
-        session_id,
-        header: snapshot.session,
-        events: snapshot.events,
-      })
-      if (result.outcome === 'named') {
-        named += 1
-        remember({ session_id, ...result })
-      } else if (result.outcome === 'skipped') {
+      // The service builds its request from the session's own eligible human
+      // messages; a session with none can never yield a valid provider result.
+      if (!foldTurns(snapshot.events).turns.some((turn) => turn.prompt !== '')) {
         skipped += 1
+        continue
       }
+      const found = await controller.resolveAgent(session_id)
+      if ('error' in found) throw found.error
+      await ctx.sessionTitle.refresh(found.agent.session)
+      named += 1
+      remember({ session_id, outcome: 'named', detail: 'catch-up refresh' })
     } catch (error) {
       failed += 1
       const detail = error instanceof Error ? error.message : String(error)
@@ -799,13 +895,15 @@ async function listCandidates(ctx, args) {
   }
   return {
     auto: {
-      trigger: 'session/event turn/end (any turn)',
+      provider: { id: PROVIDER_ID, automatic: 'all-prompts' },
+      trigger: "official schedule: every eligible human message, at that turn's first main request",
+      placeholder_refresh: 'session/event turn/end, until a title has assistant work behind it',
       catch_up: {
         window_ms: CATCHUP_WINDOW_MS,
         max_per_start: CATCHUP_MAX,
         delay_ms: CATCHUP_DELAY_MS,
       },
-      in_flight: [...in_flight],
+      pending_evidence: [...pending_evidence],
       recent,
     },
     since: new Date(since).toISOString(),
@@ -1027,25 +1125,29 @@ function registerAdminTool(ctx) {
 }
 
 export function apply(ctx) {
-  // Every turn end is a naming opportunity: turn 1 normally, but also a later
-  // turn when the first one was lost — a crash mid-turn, a host restart, or a
-  // first attempt whose model call failed. The title guard in `nameSession` keeps
-  // this to exactly one naming per session.
+  // Take the single provider slot first: everything below assumes this plugin is
+  // the one that names sessions.
+  claimProviderSlot(ctx)
+
+  // The service schedules from the human messages it sees; this hook only
+  // corrects the first title of a session, which is generated before the turn it
+  // belongs to has produced anything to classify.
   ctx.effect(
     () =>
       ctx.on('session/event', (session, event) => {
         if (event.type !== 'turn/end') return
         if (!isRootSession(session.header)) return
-        void autoName(ctx, session)
+        correctPlaceholderTitle(ctx, session)
       }),
-    'session-autoname: turn-end trigger',
+    'session-autoname: placeholder correction',
   )
   registerAdminTool(ctx)
 
-  // Catch-up for everything the live trigger could not see, once the host has
-  // settled. Scheduled through the `timer` service, whose `timeout(callback,
-  // delay)` is the documented shape; with no timer service the catch-up is
-  // skipped and said so, because the naming trigger must never depend on it.
+  // Catch-up for sessions the schedule cannot reach: it fires only on a NEW human
+  // message, so a session whose last message predates this plugin keeps its old
+  // title until it is continued. Scheduled through the `timer` service, whose
+  // `timeout(callback, delay)` is the documented shape; with no timer service the
+  // catch-up is skipped and said so, because naming must never depend on it.
   const timer = ctx.get('timer')
   if (timer === undefined) {
     remember({ outcome: 'sweep', detail: 'timer service unavailable; catch-up skipped' })

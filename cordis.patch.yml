@@ -1,11 +1,20 @@
-# dsh bundle patch: inserts this plugin into a profile's layer stack.
+# dsh bundle patch: takes over the single session-title provider slot.
 #
-# This plugin needs exactly one row. Unlike the stock
-# @deepseek-ai/dsh-session-title-first-prompt-llm provider, it does not register a
-# title provider at all (that slot accepts exactly one), so no other row has to be
-# disabled: it names a session from the `turn/end` event of its first turn and
-# writes through sessionTitle.rename(), whose supersede() aborts any in-flight
-# automatic generation for that session.
+# `sessionTitle.register()` accepts exactly ONE provider, and the stock
+# @deepseek-ai/dsh-session-title-first-prompt-llm row already holds that slot in
+# the base bundle. This bundle switches that row off and registers its own
+# `all-prompts` provider, so the official conversation-following schedule drives
+# this plugin's `MMDD｜类型｜主题` generation instead of a plain first-prompt title.
+#
+# The official "随对话更新的标题" bundle
+# (@deepseek-ai/dsh-experimental-session-titles-bundle) inserts a second
+# `all-prompts` provider. Enabling both is a configuration error: whichever loads
+# first keeps the slot, and the other fails to activate — the plugin manager marks
+# that row "异常" and the host prints one startup warning, since a host plugin has
+# no toast channel. Keep exactly one of them enabled.
+- id: session-title-llm
+  disabled: true
+
 - insert:
     - id: session-autoname
       name: '@chi-hong22/dsh-session-autoname'
