@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Automatic session names",
-    "description": "Names sessions as MMDD｜type｜topic from the whole turn and keeps updating them as the conversation grows. Use it INSTEAD OF the official Conversation-following titles plugin: both claim the one title-provider slot, the first to load wins, and the other shows a failed entry."
+    "title": "Session Auto-Naming · 会话自动命名",
+    "description": "Names sessions in the strict MMDD｜type｜topic form and keeps updating them as the conversation grows. Use it INSTEAD OF the official Conversation-following titles (随对话更新的标题): both claim the one title-provider slot, the first to load wins, and the other shows a failed entry."
   }
 }
