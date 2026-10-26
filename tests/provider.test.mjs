@@ -20,6 +20,33 @@ import { apply, name, inject } from '../session-naming.js'
 const SEP = '\uFF5C'
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
+/** Append one event to a log, with the next seq. */
+function pushEvent(log, type, data) {
+  log.push({ type, data, seq: log.length, time: 0 })
+}
+
+/** Append one complete turn: its start, the human message, tools, the answer, its end. */
+function pushTurn(log, n, turn) {
+  pushEvent(log, 'turn/start', { turn: n })
+  pushEvent(log, 'user/message', {
+    role: 'user',
+    content: [{ type: 'text', text: turn.prompt }],
+    source: { kind: 'user' },
+  })
+  for (const tool of turn.tools ?? []) {
+    pushEvent(log, 'tool/call', { turn: n, step: 1, callId: tool, name: tool, arguments: '{}' })
+  }
+  if (turn.assistant !== undefined) {
+    pushEvent(log, 'assistant/message', {
+      turn: n,
+      step: 2,
+      message: { role: 'assistant', content: [{ type: 'text', text: turn.assistant }], source: { kind: 'model' } },
+    })
+  }
+  // `end: 'open'` models a log killed mid-turn: the turn never closes.
+  if (turn.end !== 'open') pushEvent(log, 'turn/end', { turn: n, reason: { kind: turn.end ?? 'completed' } })
+}
+
 /**
  * Build one session event log.
  * @param turns - one entry per turn: its human prompt, the assistant's final
@@ -27,30 +54,9 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
  */
 function buildLog(turns, { title } = {}) {
   const log = []
-  const push = (type, data) => log.push({ type, data, seq: log.length, time: 0 })
-  push('request/header', { header: { config: { provider: 'p', model: 'm' } }, reason: 'initial' })
-  for (const [index, turn] of turns.entries()) {
-    const n = index + 1
-    push('turn/start', { turn: n })
-    push('user/message', {
-      role: 'user',
-      content: [{ type: 'text', text: turn.prompt }],
-      source: { kind: 'user' },
-    })
-    for (const tool of turn.tools ?? []) {
-      push('tool/call', { turn: n, step: 1, callId: tool, name: tool, arguments: '{}' })
-    }
-    if (turn.assistant !== undefined) {
-      push('assistant/message', {
-        turn: n,
-        step: 2,
-        message: { role: 'assistant', content: [{ type: 'text', text: turn.assistant }], source: { kind: 'model' } },
-      })
-    }
-    // `end: 'open'` models a log killed mid-turn: the turn never closes.
-    if (turn.end !== 'open') push('turn/end', { turn: n, reason: { kind: turn.end ?? 'completed' } })
-  }
-  if (title !== undefined) push('session/title', { title: title.title, source: title.source, messageSeqs: [] })
+  pushEvent(log, 'request/header', { header: { config: { provider: 'p', model: 'm' } }, reason: 'initial' })
+  for (const [index, turn] of turns.entries()) pushTurn(log, index + 1, turn)
+  if (title !== undefined) pushEvent(log, 'session/title', { title: title.title, source: title.source, messageSeqs: [] })
   return log
 }
 
@@ -65,12 +71,32 @@ function mmddOf(timestamp) {
     .replace('-', '')
 }
 
+/**
+ * Build a forked branch: the parent's log, the client's rename of the inherited
+ * title (`parent title + " (N)"`, written as a user rename), then the branch's own
+ * turns. `inherited` is the host's inheritedEventCount — how many events were
+ * copied from the parent; `ownLog` only the events the branch logged itself.
+ */
+function buildFork({ id = 'session-fork', createdAt = Date.UTC(2026, 9, 2, 1, 0, 0), title, own = [] }) {
+  const inherited = buildLog(FIRST_TURN, {
+    title: { title: `${mmddOf(createdAt)}${SEP}修复${SEP}父会话任务`, source: { kind: 'provider' } },
+  })
+  const log = [...inherited]
+  pushEvent(log, 'session/title', { title, source: { kind: 'user' }, messageSeqs: [] })
+  for (const [index, turn] of own.entries()) pushTurn(log, FIRST_TURN.length + index + 1, turn)
+  const header = { id, createdAt, cwd: 'D:/__CODE__/demo', parentSession: 'session-parent', isSeeded: true }
+  return { header, log, ownLog: log.filter((event) => event.seq >= inherited.length), inherited: inherited.length }
+}
+
 /** Build one live-session stand-in backed by a fixed event log. */
-function fakeSession({ id = 'session-test', createdAt, cwd = 'D:\\__CODE__\\demo', log = buildLog(FIRST_TURN), header } = {}) {
+function fakeSession({ id = 'session-test', createdAt, cwd = 'D:\\__CODE__\\demo', log = buildLog(FIRST_TURN), header, inherited } = {}) {
   return {
     id,
     header: header ?? { id, createdAt, cwd },
     snapshotEvents: () => log,
+    // A live Session reports only the events of a forked branch; a root session's
+    // own log is its whole log.
+    ownEvents: () => (inherited === undefined ? log : log.filter((event) => event.seq >= inherited)),
   }
 }
 
@@ -388,15 +414,156 @@ test('the placeholder is never overwritten once the human pinned the title', asy
   assert.equal(captured.refreshes.length, 0, 'a user rename pins the title')
 })
 
-test('a subagent session gets a deterministic placeholder without a model call', async () => {
+test('a forked branch is unpinned once its own turn completes, exactly once', async () => {
+  const createdAt = Date.UTC(2026, 9, 2, 1, 0, 0)
+  const fork = buildFork({
+    title: `1002${SEP}修复${SEP}父会话任务 (1)`,
+    own: [{ prompt: '继续补一条离线校验', assistant: '已补上离线校验并跑通' }],
+  })
+  const session = fakeSession({ id: fork.header.id, createdAt, header: fork.header, log: fork.log, inherited: fork.inherited })
+  const { ctx, captured } = fakeContext({ sessions: [session], timer: null })
+  apply(ctx)
+  captured.listeners['session/event'](session, {
+    type: 'turn/end',
+    data: { turn: 2, reason: { kind: 'completed' } },
+    seq: 99,
+  })
+  await sleep(10)
+  assert.equal(captured.refreshes.length, 1, 'the fork rename is a pin the service never lifts on its own')
+  // The refresh writes a provider title; from then on the branch is an ordinary
+  // conversation and the hook must not request another refresh.
+  pushEvent(fork.log, 'session/title', {
+    title: `1002${SEP}修复${SEP}离线校验补充 (1)`,
+    source: { kind: 'provider' },
+    messageSeqs: [],
+  })
+  captured.listeners['session/event'](session, {
+    type: 'turn/end',
+    data: { turn: 3, reason: { kind: 'completed' } },
+    seq: 100,
+  })
+  await sleep(10)
+  assert.equal(captured.refreshes.length, 1)
+})
+
+test('a forked branch the human renamed is left alone', async () => {
+  const createdAt = Date.UTC(2026, 9, 2, 1, 0, 0)
+  const fork = buildFork({ title: `1002${SEP}修复${SEP}父会话任务 (1)` })
+  pushEvent(fork.log, 'session/title', { title: `1002${SEP}设计${SEP}分支手工命名`, source: { kind: 'user' }, messageSeqs: [] })
+  const session = fakeSession({ id: fork.header.id, createdAt, header: fork.header, log: fork.log, inherited: fork.inherited })
+  const { ctx, captured } = fakeContext({ sessions: [session], timer: null })
+  apply(ctx)
+  captured.listeners['session/event'](session, {
+    type: 'turn/end',
+    data: { turn: 2, reason: { kind: 'completed' } },
+    seq: 99,
+  })
+  await sleep(10)
+  assert.equal(captured.refreshes.length, 0, 'the second rename is the human pinning the branch')
+})
+
+test('a subagent run never reaches the correction hook', async () => {
+  const createdAt = Date.UTC(2026, 9, 2, 1, 0, 0)
+  const session = fakeSession({
+    createdAt,
+    header: {
+      id: 'session-sub',
+      createdAt,
+      cwd: 'D:/__CODE__/demo',
+      parentSession: 'root',
+      origin: 'subagent',
+      delegationDepth: 1,
+    },
+  })
+  const { ctx, captured } = fakeContext({ sessions: [session], timer: null })
+  apply(ctx)
+  captured.listeners['session/event'](session, {
+    type: 'turn/end',
+    data: { turn: 1, reason: { kind: 'completed' } },
+    seq: 999,
+  })
+  await sleep(10)
+  assert.equal(captured.refreshes.length, 0)
+})
+
+test('a subagent run gets a deterministic placeholder without a model call', async () => {
+  // A real subagent header carries `origin`; a forked branch carries `isSeeded`
+  // instead and IS a conversation this plugin names.
   const session = fakeSession({
     createdAt: Date.UTC(2026, 9, 2, 1, 0, 0),
-    header: { id: 'session-test', createdAt: Date.UTC(2026, 9, 2, 1, 0, 0), cwd: 'D:\\x', parentSession: 'root' },
+    header: { id: 'session-test', createdAt: Date.UTC(2026, 9, 2, 1, 0, 0), cwd: 'D:\\x', parentSession: 'root', origin: 'subagent', delegationDepth: 1 },
   })
   const { title, captured, result } = await runAuto({}, { session })
   assert.equal(title, PLACEHOLDER)
   assert.deepEqual(result.messageSeqs, [3])
   assert.equal(captured.request, undefined)
+})
+
+test('a forked branch is named from its own work and keeps the branch counter', async () => {
+  const createdAt = Date.UTC(2026, 9, 2, 1, 0, 0)
+  const fork = buildFork({
+    title: `1002${SEP}修复${SEP}父会话任务 (1)`,
+    own: [{ prompt: '继续补一条离线校验', assistant: '已补上离线校验并跑通' }],
+  })
+  const session = fakeSession({ id: fork.header.id, createdAt, header: fork.header, log: fork.log, inherited: fork.inherited })
+  const own_prompt = fork.ownLog.find((event) => event.type === 'user/message')
+  const messages = [
+    { seq: 1, text: '请修复登录报错' },
+    { seq: own_prompt.seq, text: '继续补一条离线校验' },
+  ]
+  const { title, captured, result } = await runAuto(
+    { reply: `{"title":"1002${SEP}修复${SEP}离线校验补充"}` },
+    { session, messages },
+  )
+  // The client appended the counter when it forked; the new title keeps it at the
+  // end of the topic, so this branch stays distinguishable from its siblings.
+  assert.equal(title, `1002${SEP}修复${SEP}离线校验补充 (1)`)
+  assert.deepEqual(result.messageSeqs, [1, own_prompt.seq])
+  // The inherited first turn plus the branch's own turn are the evidence.
+  const framed = captured.request.messages[0].content[0].text
+  assert.match(framed, /whole_conversation/)
+  // The inherited title is a client rename, not evidence the model should anchor on.
+  assert.match(framed, /"current_title":null/)
+})
+
+test('a forked branch keeps a full-width branch counter too', async () => {
+  const createdAt = Date.UTC(2026, 9, 2, 1, 0, 0)
+  const fork = buildFork({
+    title: `1002${SEP}优化${SEP}父会话任务（2）`,
+    own: [{ prompt: '继续优化', assistant: '优化完成并验证通过' }],
+  })
+  const session = fakeSession({ id: fork.header.id, createdAt, header: fork.header, log: fork.log, inherited: fork.inherited })
+  const { title } = await runAuto(
+    { reply: `{"title":"1002${SEP}优化${SEP}分支任务收口"}` },
+    { session, messages: [{ seq: 1, text: '请修复登录报错' }] },
+  )
+  assert.equal(title, `1002${SEP}优化${SEP}分支任务收口（2）`)
+})
+
+test('a branch counter the model echoes back differently is normalized to the branch', async () => {
+  const createdAt = Date.UTC(2026, 9, 2, 1, 0, 0)
+  const fork = buildFork({
+    title: `1002${SEP}修复${SEP}父会话任务 (1)`,
+    own: [{ prompt: '继续补一条离线校验', assistant: '已补上离线校验并跑通' }],
+  })
+  const session = fakeSession({ id: fork.header.id, createdAt, header: fork.header, log: fork.log, inherited: fork.inherited })
+  const { title } = await runAuto(
+    { reply: `{"title":"1002${SEP}修复${SEP}离线校验补充 (9)"}` },
+    { session, messages: [{ seq: 1, text: '请修复登录报错' }] },
+  )
+  // A drifted counter would let a later fork of this branch count from 9.
+  assert.equal(title, `1002${SEP}修复${SEP}离线校验补充 (1)`)
+})
+
+test('a forked branch keeps its counter even in the deterministic placeholder', async () => {
+  const createdAt = Date.UTC(2026, 9, 2, 1, 0, 0)
+  const fork = buildFork({
+    title: `1002${SEP}修复${SEP}父会话任务 (1)`,
+    own: [{ prompt: '继续补一条离线校验', assistant: '已补上离线校验并跑通' }],
+  })
+  const session = fakeSession({ id: fork.header.id, createdAt, header: fork.header, log: fork.log, inherited: fork.inherited })
+  const { title } = await runAuto({ reply: 'not a title' }, { session })
+  assert.equal(title, `${PLACEHOLDER} (1)`)
 })
 
 test('an aborted generation rethrows so the service records nothing', async () => {
@@ -518,6 +685,80 @@ test('catch-up sweep leaves a placeholder alone until the turn has work to class
     query,
     reply: `{"title":"${mmdd}${SEP}修复${SEP}崩在半路的排查"}`,
     controller: { resolveAgent: async () => ({ agent: { session: { id: 'session-open', header } } }) },
+  })
+  apply(ctx)
+  await sleep(60)
+  assert.equal(captured.refreshes.length, 0)
+})
+
+test('catch-up sweep unpins a forked branch that worked while the host was down', async () => {
+  const createdAt = Date.now() - 60 * 60 * 1000
+  const mmdd = mmddOf(createdAt)
+  const fork = buildFork({
+    createdAt,
+    title: `${mmdd}${SEP}修复${SEP}父会话任务 (1)`,
+    own: [{ prompt: '继续补一条离线校验', assistant: '已补上离线校验并跑通' }],
+  })
+  const current = fork.log.filter((event) => event.type === 'session/title').at(-1).data
+  const query = {
+    listSessions: async () => [{ header: fork.header, live: false, persisted: true }],
+    readTitleSnapshots: async () => [
+      { sessionId: fork.header.id, status: 'fulfilled', value: { session: fork.header, title: current } },
+    ],
+    readSession: async () => ({ session: fork.header, inheritedEventCount: fork.inherited, events: fork.log }),
+  }
+  const { ctx, captured } = fakeContext({
+    query,
+    reply: `{"title":"${mmdd}${SEP}修复${SEP}离线校验补充 (1)"}`,
+    controller: { resolveAgent: async () => ({ agent: { session: { id: fork.header.id, header: fork.header } } }) },
+  })
+  apply(ctx)
+  await sleep(60)
+  assert.equal(captured.refreshes.length, 1, 'the branch worked on its own, so the inherited pin is stale')
+})
+
+test('catch-up sweep leaves a forked branch alone until it worked on its own', async () => {
+  const createdAt = Date.now() - 60 * 60 * 1000
+  const mmdd = mmddOf(createdAt)
+  const fork = buildFork({ createdAt, title: `${mmdd}${SEP}修复${SEP}父会话任务 (1)` })
+  const current = fork.log.filter((event) => event.type === 'session/title').at(-1).data
+  const query = {
+    listSessions: async () => [{ header: fork.header, live: false, persisted: true }],
+    readTitleSnapshots: async () => [
+      { sessionId: fork.header.id, status: 'fulfilled', value: { session: fork.header, title: current } },
+    ],
+    readSession: async () => ({ session: fork.header, inheritedEventCount: fork.inherited, events: fork.log }),
+  }
+  const { ctx, captured } = fakeContext({
+    query,
+    reply: `{"title":"${mmdd}${SEP}修复${SEP}离线校验补充 (1)"}`,
+    controller: { resolveAgent: async () => ({ agent: { session: { id: fork.header.id, header: fork.header } } }) },
+  })
+  apply(ctx)
+  await sleep(60)
+  assert.equal(captured.refreshes.length, 0, 'an unused branch keeps the inherited title')
+})
+
+test('catch-up sweep leaves a forked branch the human renamed alone', async () => {
+  const createdAt = Date.now() - 60 * 60 * 1000
+  const fork = buildFork({
+    createdAt,
+    title: `${mmddOf(createdAt)}${SEP}修复${SEP}父会话任务 (1)`,
+    own: [{ prompt: '继续补一条离线校验', assistant: '已补上离线校验并跑通' }],
+  })
+  pushEvent(fork.log, 'session/title', { title: `${mmddOf(createdAt)}${SEP}设计${SEP}分支手工命名`, source: { kind: 'user' }, messageSeqs: [] })
+  const current = fork.log.filter((event) => event.type === 'session/title').at(-1).data
+  const query = {
+    listSessions: async () => [{ header: fork.header, live: false, persisted: true }],
+    readTitleSnapshots: async () => [
+      { sessionId: fork.header.id, status: 'fulfilled', value: { session: fork.header, title: current } },
+    ],
+    readSession: async () => ({ session: fork.header, inheritedEventCount: fork.inherited, events: fork.log }),
+  }
+  const { ctx, captured } = fakeContext({
+    query,
+    reply: `{"title":"${mmddOf(createdAt)}${SEP}设计${SEP}离线校验补充"}`,
+    controller: { resolveAgent: async () => ({ agent: { session: { id: fork.header.id, header: fork.header } } }) },
   })
   apply(ctx)
   await sleep(60)
