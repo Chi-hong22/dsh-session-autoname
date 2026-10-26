@@ -22,6 +22,11 @@
  *   once when the turn ends; after that the schedule alone is enough.
  * - A user rename still pins the title: the service schedules nothing for a
  *   user-source title, and the placeholder correction skips it too.
+ * - A forked branch is a conversation too. The client inherits the parent's title
+ *   with a branch counter (`… (1)`) and writes that as a user rename, which the
+ *   service reads as a pin. Once the branch's own first turn has produced work,
+ *   the plugin refreshes it and keeps the counter at the end of the generated
+ *   topic; a branch that was forked and never used keeps its inherited title.
  *
  * The official "随对话更新的标题" bundle competes for the same single slot. When
  * this plugin finds the slot taken it refuses to activate and says why: a host
@@ -66,6 +71,13 @@ const MAX_TOPIC_BYTES = 60
 const FALLBACK_TOPIC_CHARS = 12
 /** Type the deterministic placeholder always carries. */
 const PLACEHOLDER_TYPE = '探索'
+/**
+ * Branch counter the GUI appends to a forked conversation's inherited title:
+ * `" (1)"` for the first branch, `" (2)"` for the second, plus full-width `（N）`
+ * variants. Kept at the end of the topic so sibling branches stay distinct and
+ * forking a branch again keeps counting up.
+ */
+const FORK_SUFFIX_PATTERN = /\s*[（(]\d+[）)]$/u
 
 /** Timeout of one auxiliary title model call. */
 const LLM_TIMEOUT_MS = 90 * 1000
@@ -88,7 +100,7 @@ const HISTORY_WINDOW_MS = 60 * 24 * 60 * 60 * 1000
  * Catch-up policy. The provider is only called while this host is running, so two
  * states outlive a restart: a session whose first title is still the placeholder
  * (its turn-end correction never ran) and a session created while the plugin was
- * not mounted (no title at all). After start, recent root sessions in either state
+ * not mounted (no title at all). After start, recent conversations in either state
  * are refreshed once through the same provider slot.
  *
  * The window and the cap bound that sweep, so a start can never become a mass
@@ -569,6 +581,58 @@ function looksLikePlaceholder(title, mmdd) {
 }
 
 /**
+ * Whether a session header is a conversation a person reads. Every session is one
+ * except a subagent run: a forked branch carries `parentSession`/`isSeeded` too,
+ * but the client shows it as an ordinary conversation, and it must be named.
+ */
+function isConversationSession(header) {
+  return header?.origin !== 'subagent'
+}
+
+/**
+ * Whether a conversation was forked from another one. The GUI creates the child
+ * with `isSeeded: true` and the parent's id; a subagent run has the same
+ * `parentSession` but is excluded by its `origin`.
+ */
+function isForkedConversation(header) {
+  return (
+    isConversationSession(header) && header?.isSeeded === true && header?.parentSession !== undefined
+  )
+}
+
+/** The branch counter at the end of an inherited fork title, or null. */
+function forkSuffixOf(title) {
+  if (typeof title !== 'string') return null
+  const match = FORK_SUFFIX_PATTERN.exec(title)
+  return match === null ? null : match[0]
+}
+
+/**
+ * Put the branch counter back at the end of a generated title, so sibling branches
+ * of one conversation stay distinguishable and forking a branch again still counts
+ * up. The counter is part of the displayed title, so the topic gives up its bytes.
+ * A counter the model echoed back is normalized to the branch's own: after the
+ * first upgrade the model sees the counter inside `current_title` and may repeat it,
+ * and a drift would let a later fork count from the wrong number.
+ */
+function withForkSuffix(title, suffix) {
+  if (suffix === null) return title
+  const existing = forkSuffixOf(title)
+  if (existing === suffix) return title
+  const base = existing === null ? title : title.slice(0, title.length - existing.length)
+  const cut = base.lastIndexOf(SEPARATOR)
+  if (cut <= 0) return title
+  const head = base.slice(0, cut + SEPARATOR.length)
+  let topic = base.slice(cut + SEPARATOR.length)
+  let combined = `${topic}${suffix}`
+  while (bytesOf(`${head}${combined}`) > MAX_TITLE_BYTES && [...topic].length > 1) {
+    topic = [...topic].slice(0, -1).join('').trimEnd()
+    combined = `${topic}${suffix}`
+  }
+  return `${head}${combined}`
+}
+
+/**
  * One provider generation, exactly as the title service calls it.
  *
  * `messages` are the eligible human messages the service collected; the session
@@ -588,12 +652,19 @@ async function generateSessionTitle(ctx, request) {
   const mmdd = mmddOf(header.createdAt)
   const projects = await projectNamesOf(ctx, header)
   const placeholder = () => fallbackTitleOf(mmdd, messages[0]?.text ?? '', projects)
-  const placeholder_result = () => ({ title: placeholder(), messageSeqs: message_seqs })
   // Subagent runs are not conversations a person reads; naming them from their
   // own first prompt keeps the sidebar format uniform without a model call.
-  if (!isRootSession(header)) return placeholder_result()
+  if (!isConversationSession(header)) {
+    return { title: placeholder(), messageSeqs: message_seqs }
+  }
   const events = session.snapshotEvents()
   const state = titleStateOf(events)
+  // A forked branch inherits the parent's title with a branch counter, written by
+  // the client as a user rename. Keep that counter whatever this generation
+  // decides, so the branch stays distinguishable from its siblings.
+  const fork_suffix = isForkedConversation(header) ? forkSuffixOf(state?.title) : null
+  const stamped = (title) => withForkSuffix(title, fork_suffix)
+  const placeholder_result = () => ({ title: stamped(placeholder()), messageSeqs: message_seqs })
   // A title this plugin derived itself (the placeholder) is not evidence: anchoring
   // the turn-end correction on it would invite the model to return it verbatim, and
   // the correction would clear itself while leaving a placeholder behind. Compare
@@ -627,10 +698,10 @@ async function generateSessionTitle(ctx, request) {
   }
   try {
     const route = request.route ?? routeOf(ctx, header, events)
-    const title = await generateTitle(ctx, { route, session_id, data, mmdd, projects, signal })
+    const accepted = stamped(await generateTitle(ctx, { route, session_id, data, mmdd, projects, signal }))
     pending_evidence.delete(session_id)
-    remember({ session_id, outcome: 'named', detail: title, scope: data.scope })
-    return { title, messageSeqs: message_seqs, model: route }
+    remember({ session_id, outcome: 'named', detail: accepted, scope: data.scope })
+    return { title: accepted, messageSeqs: message_seqs, model: route }
   } catch (error) {
     if (signal?.aborted === true) throw error
     const detail = error instanceof Error ? error.message : String(error)
@@ -693,16 +764,51 @@ function correctPlaceholderTitle(ctx, session) {
 }
 
 /**
+ * Give a forked branch its own title.
+ *
+ * The client forks by copying the parent's title with a branch counter and writing
+ * it as a user rename. The service treats every user-source title as a human pin
+ * and stops scheduling that session, so the branch would keep the inherited title
+ * forever — including through turns where its own work makes it a different
+ * conversation. Once the branch has produced its own completed turn, refresh it
+ * through the provider: `generateSessionTitle` keeps the counter, and the
+ * provider-source title lets later turns keep updating it.
+ *
+ * Only the client's own fork rename qualifies. The check is the branch's own log:
+ * exactly one `session/title`, a user source, a counter at the end. A human rename
+ * adds a second title, a finished upgrade adds the provider title, and an unused
+ * branch has no new turn at all, so none of them is touched again.
+ */
+function upgradeForkTitle(ctx, session) {
+  if (!isForkedConversation(session.header)) return
+  // A pending placeholder correction re-generates through the same provider, and
+  // that generation already preserves the counter; do not start a second one.
+  if (pending_evidence.has(session.id)) return
+  const own_titles = session.ownEvents().filter((event) => event.type === 'session/title')
+  if (own_titles.length !== 1) return
+  const only = own_titles[0]
+  if (only.data?.source?.kind !== 'user') return
+  if (forkSuffixOf(only.data.title) === null) return
+  void ctx.sessionTitle.refresh(session).catch((error) => {
+    const detail = error instanceof Error ? error.message : String(error)
+    remember({ session_id: session.id, outcome: 'failed', detail: `fork refresh: ${detail}` })
+    ctx.logger?.warn?.(`session-autoname: ${session.id}: fork refresh failed: ${detail}`)
+  })
+}
+
+/**
  * Catch-up sweep for sessions the provider schedule can no longer reach: the
  * service only schedules on a NEW human message, so a session whose last message
  * predates this plugin keeps its old title until it is continued.
  *
- * Runs once, a few seconds after this plugin applies: refresh every recent root
- * session without a compliant title, plus every one still carrying this plugin's
- * own placeholder after its turn produced work. `refresh` keeps the title a
- * provider title, so the schedule keeps updating it later; a rename would pin it.
- * Older sessions are deliberately out of scope — the schedule reaches them when
- * they are continued, and the `summarize` action reaches them on request.
+ * Runs once, a few seconds after this plugin applies: refresh every recent
+ * conversation without a compliant title, plus every one still carrying this
+ * plugin's own placeholder after its turn produced work, plus every forked branch
+ * whose own first turn finished while the host was down (its inherited title is a
+ * client rename the turn-end correction never unpinned). `refresh` keeps the title
+ * a provider title, so the schedule keeps updating it later; a rename would pin
+ * it. Older sessions are deliberately out of scope — the schedule reaches them
+ * when they are continued, and the `summarize` action reaches them on request.
  */
 async function sweep(ctx) {
   const query = ctx.get('sessionQuery')
@@ -717,7 +823,7 @@ async function sweep(ctx) {
   }
   const since = Date.now() - CATCHUP_WINDOW_MS
   const records = (await query.listSessions())
-    .filter((record) => isRootSession(record.header) && record.header.createdAt >= since)
+    .filter((record) => isConversationSession(record.header) && record.header.createdAt >= since)
     .sort((a, b) => b.header.createdAt - a.header.createdAt)
   // One bulk title fold decides which of them even need a full log read.
   const titles = await query.readTitleSnapshots(records.map((record) => record.header.id))
@@ -728,7 +834,20 @@ async function sweep(ctx) {
     if (record === undefined) continue
     const state = result.value.title
     const mmdd = mmddOf(record.header.createdAt)
-    if (state?.source?.kind === 'user') continue
+    if (state?.source?.kind === 'user') {
+      // The client's fork rename is the one user-source title that is not a human
+      // pin. If the branch produced its own work while the host was down, no
+      // turn-end correction ever unpinned it, so the sweep does that once.
+      if (!isForkedConversation(record.header) || forkSuffixOf(state.title) === null) continue
+      pending.push({
+        header: record.header,
+        mmdd,
+        title: state.title,
+        placeholder_shape: false,
+        fork_shape: true,
+      })
+      continue
+    }
     // A placeholder is compliant by construction, so compliance alone would hide
     // every session whose first turn completed while the host was already gone.
     const compliant = state !== undefined && isCompliantTitle(state.title, mmdd)
@@ -738,6 +857,7 @@ async function sweep(ctx) {
       mmdd,
       title: state?.title ?? null,
       placeholder_shape: compliant,
+      fork_shape: false,
     })
   }
   let refreshed = 0
@@ -764,6 +884,24 @@ async function sweep(ctx) {
       if (!has_work) {
         skipped += 1
         continue
+      }
+      if (entry.fork_shape) {
+        // Only the client's own fork rename survives: a human rename or an
+        // earlier upgrade stays, and a branch with no work of its own keeps the
+        // inherited title (naming an unused branch would be busywork).
+        const inherited = snapshot.inheritedEventCount ?? 0
+        const own = snapshot.events.filter((event) => event.seq >= inherited)
+        const own_titles = own.filter((event) => event.type === 'session/title')
+        const own_work = foldTurns(own).turns.some((turn) => turn.outcome !== '')
+        if (own_titles.length !== 1 || !own_work) {
+          skipped += 1
+          continue
+        }
+        const only = own_titles[0]
+        if (only.data?.source?.kind !== 'user' || forkSuffixOf(only.data.title) === null) {
+          skipped += 1
+          continue
+        }
       }
       if (entry.placeholder_shape) {
         // Only the exact placeholder this plugin derives: a real `探索` title
@@ -817,7 +955,7 @@ async function headerOf(ctx, session_id) {
  */
 async function writeTitle(ctx, session_id, requested, known_header) {
   const header = known_header ?? (await headerOf(ctx, session_id))
-  if (header?.parentSession !== undefined || header?.origin === 'subagent') {
+  if (!isConversationSession(header)) {
     throw new Error('subagent sessions are out of scope')
   }
   const mmdd = mmddOf(header.createdAt)
@@ -852,7 +990,7 @@ const ADMIN_PARAMETERS = {
       type: 'string',
       enum: ['list', 'inspect', 'summarize', 'apply', 'archive', 'selftest'],
       description:
-        'list = recent root sessions with their current title and this plugin\'s recent automatic outcomes; ' +
+        'list = recent conversations (forked branches included) with their current title and this plugin\'s recent automatic outcomes; ' +
         'inspect = first-turn evidence for one session; ' +
         'summarize = name ONE specified conversation by summarizing its whole content (dry_run previews without writing); ' +
         'apply = write exact titles through sessionTitle.rename / sessionController.rename; ' +
@@ -901,18 +1039,17 @@ const ADMIN_PARAMETERS = {
 const SELFTEST_PROMPT =
   '请只回答（不要调用任何工具，不要创建或修改任何文件）：PowerShell 报错 CommandNotFoundException 通常意味着什么？用两三句话说明。'
 
-/** Sessions the admin tool may list or rename: root sessions only, never subagent runs. */
-function isRootSession(header) {
-  return header?.parentSession === undefined && header?.origin !== 'subagent'
-}
-
+/**
+ * Recent conversations, newest first. The admin tool lists and renames
+ * conversations; a forked branch is one, a subagent run is not.
+ */
 async function listCandidates(ctx, args) {
   const query = ctx.get('sessionQuery')
   if (query === undefined) throw new Error('sessionQuery is unavailable in this composition')
   const since = typeof args.since === 'number' ? args.since : Date.now() - HISTORY_WINDOW_MS
   const records = await query.listSessions()
   const candidates = records
-    .filter((record) => isRootSession(record.header) && record.header.createdAt >= since)
+    .filter((record) => isConversationSession(record.header) && record.header.createdAt >= since)
     .sort((a, b) => b.header.createdAt - a.header.createdAt)
   const snapshots = await query.readTitleSnapshots(candidates.map((record) => record.header.id))
   const by_id = new Map(
@@ -943,6 +1080,7 @@ async function listCandidates(ctx, args) {
       session_id: record.header.id,
       created_at: new Date(record.header.createdAt).toISOString(),
       mmdd,
+      forked: isForkedConversation(record.header),
       cwd: record.header.cwd ?? null,
       live: record.live,
       persisted: record.persisted,
@@ -957,6 +1095,8 @@ async function listCandidates(ctx, args) {
       provider: { id: PROVIDER_ID, automatic: 'all-prompts' },
       trigger: "official schedule: every eligible human message, at that turn's first main request",
       placeholder_refresh: 'session/event turn/end, until a title has assistant work behind it',
+      fork_branch_refresh:
+        "session/event turn/end, once a forked branch's own first turn has completed",
       catch_up: {
         window_ms: CATCHUP_WINDOW_MS,
         max_per_start: CATCHUP_MAX,
@@ -991,6 +1131,8 @@ async function inspectSession(ctx, args) {
     cwd: snapshot.session.cwd ?? null,
     parent_session: snapshot.session.parentSession ?? null,
     origin: snapshot.session.origin ?? null,
+    is_forked: isForkedConversation(snapshot.session),
+    inherited_event_count: snapshot.inheritedEventCount ?? 0,
     event_count: snapshot.events.length,
     turn_count: turns.length,
     first_turn_end: first?.end ?? null,
@@ -1013,7 +1155,7 @@ async function summarizeSession(ctx, args) {
   }
   const snapshot = await query.readSession(session_id)
   const header = snapshot.session
-  if (!isRootSession(header)) throw new Error('subagent sessions are out of scope')
+  if (!isConversationSession(header)) throw new Error('subagent sessions are out of scope')
   const mmdd = mmddOf(header.createdAt)
   const projects = await projectNamesOf(ctx, header)
   const data = conversationData(foldTurns(snapshot.events), mmdd, projects)
@@ -1142,7 +1284,7 @@ function registerAdminTool(ctx) {
     name: 'session_title_admin',
     description:
       'Inspect and correct DeepSeek Harness session titles through the official title service. ' +
-      'Use list to see recent root sessions, their current titles, and recent automatic-naming outcomes; ' +
+      'Use list to see recent conversations, their current titles, and recent automatic-naming outcomes; ' +
       'inspect to read one session\'s first-turn evidence; ' +
       'summarize to name ONE specified conversation from its whole content; ' +
       'apply to write exact MMDD｜类型｜主题 renames (each re-validated against that session\'s own createdAt); ' +
@@ -1188,17 +1330,19 @@ export function apply(ctx) {
   // the one that names sessions.
   claimProviderSlot(ctx)
 
-  // The service schedules from the human messages it sees; this hook only
-  // corrects the first title of a session, which is generated before the turn it
-  // belongs to has produced anything to classify.
+  // The service schedules from the human messages it sees; this hook corrects the
+  // two titles it cannot reach: the first title of a session, generated before its
+  // turn had anything to classify, and a forked branch's inherited title, which the
+  // client wrote as a user rename (a pin) when the branch was created.
   ctx.effect(
     () =>
       ctx.on('session/event', (session, event) => {
         if (event.type !== 'turn/end') return
-        if (!isRootSession(session.header)) return
+        if (!isConversationSession(session.header)) return
         correctPlaceholderTitle(ctx, session)
+        upgradeForkTitle(ctx, session)
       }),
-    'session-autoname: placeholder correction',
+    'session-autoname: title correction',
   )
   registerAdminTool(ctx)
 
