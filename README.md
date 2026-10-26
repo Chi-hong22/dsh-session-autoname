@@ -1,10 +1,12 @@
 # @chi-hong22/dsh-session-autoname
 
-DeepSeek Harness host plugin: keep every root conversation titled in the strict
+DeepSeek Harness host plugin: keep every conversation titled in the strict
 `MMDD｜类型｜主题` form, refreshed as the conversation moves — the DSH port of a
 Codex `Stop`-hook renaming setup, driven by the harness's own conversation-following
-title schedule. It also names any specified conversation on demand by summarizing its
-whole content, and it catches up on sessions whose title never became compliant.
+title schedule. A conversation forked from another one is named from the branch's own
+work too, keeping the branch counter the GUI appends. It also names any specified
+conversation on demand by summarizing its whole content, and it catches up on sessions
+whose title never became compliant.
 
 Installs as a profile bundle — from GitHub, or from the out-of-tree working copy at
 `D:\__CODE__\_tookit\261002_dsh-session-autoname`:
@@ -24,7 +26,8 @@ dsh plugin --profile desktop add "D:/__CODE__/_tookit/261002_dsh-session-autonam
 
 ## 中文说明
 
-- **作用**：用严格格式 `MMDD｜类型｜主题` 给根会话命名并随对话更新；也能按需（`summarize`）通读整段对话命名；启动时补扫近期未合规的会话。
+- **作用**：用严格格式 `MMDD｜类型｜主题` 给会话命名并随对话更新（分叉出的分支会话也纳入，见下条）；也能按需（`summarize`）通读整段对话命名；启动时补扫近期未合规的会话。
+- **分叉分支**：从某个会话分叉出的新会话，GUI 会把父标题加分支号（如 `… (1)`）写成用户级改名，标题服务据此视为"人类已钉住"。本插件把这种继承标题识别为分叉痕迹：分支自己的第一轮完成且有产出后重新命名，并保留分支号在主题末尾（再次分叉时编号继续递增）；只分叉、未使用的分支保留继承标题，不做无意义的模型调用。
 - **与官方插件互斥**：两者争抢同一个标题提供方槽位，只能启用其中一个。本插件的补丁会关掉自带的 `session-title-llm`（首条提示提供方）；若官方"随对话更新的标题"同时启用，先加载者拿到槽位，另一个在插件页显示"异常"，不会出现"显示运行却从不写标题"的空转。运行时如果槽位已被占用，本插件直接报错退出注册，绝不 `rename`、绝不钉住标题。
 - **怎么切换**：最佳状态是只开本插件；官方插件默认不在 profile 里，不打开就是关闭。要换成官方：先关掉本插件的**整个 bundle**并重启（让出槽位），再打开"随对话更新的标题"并再重启一次；换回来时反向操作。不要只关本插件内部的 `session-autoname` 行而保留 bundle——补丁仍会关着自带提供方，结果是没有任何提供方在工作，标题只剩服务兜底。
 - **节奏**：服务每收到一条人类提示调度一次标题请求（`all-prompts`），因此标题会滞后一轮；首轮请求发生在助手产出之前，只能先写占位 `MMDD｜探索｜首句前 12 字`，该轮 `turn/end` 时自动纠正为正式标题。
@@ -60,6 +63,14 @@ this plugin owns the judgement:
   asks the service for one `refresh()` — the same slot, the same provider-source
   write, now with the turn's completed work. A later turn then names from the whole
   conversation.
+- A fork of a conversation: the GUI copies the parent's title with a branch counter
+  (`… (1)`, `…（2）`) into the child as a user rename, which the service reads as a
+  human pin. Once the branch's own first turn completes with work, the plugin
+  refreshes it so the branch is named from its own direction, and the counter is put
+  back at the end of the topic (normalized to the branch's own number if the model
+  echoes a different one). The branch's own log decides: a human rename after the
+  fork adds a second title and is left alone, and a branch forked but never used
+  keeps the inherited title — there is nothing of its own to classify.
 - Staying stable across turns: the request carries the current title, and the model
   is told to return it verbatim while it still describes the main task. A type or
   topic changes only when the task itself changed — not every turn produces a new
@@ -69,8 +80,9 @@ this plugin owns the judgement:
   (never `updatedAt`, never the host clock).
 - Skip conditions: a subagent session (deterministic placeholder, no model call);
   the human already renamed the session (the service stops scheduling, and the
-  correction step checks the latest title's source before refreshing); the generated
-  title fails validation.
+  correction step checks the latest title's source before refreshing — the client's
+  fork rename is the one exception, unpinned once the branch has its own work); the
+  generated title fails validation.
 - Failure: the model call being aborted is re-thrown so the service records nothing;
   any other failure keeps a compliant placeholder on the session and records
   `failed` in the admin tool's `auto.recent` ring.
@@ -96,23 +108,27 @@ sessions are written through `sessionTitle.rename`; cold ones through
 a user rename, it also pins that session: later automatic revisions stop, and asking
 the provider to refresh it again is the deliberate unpin.
 
-Other actions: `list` (recent root sessions, their titles, the provider and trigger
-state, the pending corrections, and recent automatic outcomes), `inspect` (one
-session's first-turn evidence), `apply` (exact renames, each re-validated against
-that session's own `createdAt`), `archive` (hide throwaway test sessions),
-`selftest` (create a throwaway session and prove real automatic naming end to end).
+Other actions: `list` (recent conversations, their titles, the provider and trigger
+state, whether a session is a forked branch, the pending corrections, and recent
+automatic outcomes), `inspect` (one session's first-turn evidence), `apply` (exact
+renames, each re-validated against that session's own `createdAt`), `archive` (hide
+throwaway test sessions), `selftest` (create a throwaway session and prove real
+automatic naming end to end).
 
 ### 3. Catch-up sweep after a crash or restart
 
 The schedule belongs to the service, and a host that dies mid-turn or before the
 first main request never reaches it. Five seconds after this plugin applies it
-therefore refreshes recent root sessions that are **still without a compliant
-title**, plus those **still carrying the deterministic placeholder**, inside a
-bounded window. Either way the session must already contain assistant work: with
-nothing produced there is nothing to classify, and a refresh would only rewrite the
-same placeholder or replace a readable fallback with one. A placeholder is replaced
-only once its own turn finished — a turn still running gets the `turn/end`
-correction instead. A cold session is resumed through
+therefore refreshes recent conversations that are **still without a compliant
+title**, plus those **still carrying the deterministic placeholder**, plus **forked
+branches whose inherited title is still the client's rename** after the branch itself
+produced a completed turn, inside a bounded window. Either way the session must
+already contain assistant work: with nothing produced there is nothing to classify,
+and a refresh would only rewrite the same placeholder or replace a readable fallback
+with one. A placeholder is replaced only once its own turn finished — a turn still
+running gets the `turn/end` correction instead. For a branch only its own events
+count: the inherited prefix is skipped through `inheritedEventCount`, so an unused
+branch is never named. A cold session is resumed through
 `sessionController.resolveAgent` to obtain the live session the service needs; the
 write stays provider-source, so it never pins.
 
@@ -217,7 +233,7 @@ the loader sees a URL it has not cached.
 ## Verifying
 
 ```powershell
-node --test tests/provider.test.mjs      # offline: the provider contract, rules, rejections, corrections, catch-up, admin tool
+node --test tests/provider.test.mjs      # offline: the provider contract, rules, rejections, corrections, forked branches, catch-up, admin tool
 node tools/history-evidence.mjs 0        # read-only first-turn digests of root sessions
 ```
 
@@ -239,5 +255,11 @@ path, and `{"action":"list"}` to read the provider state and recent outcomes.
   is asked for it.
 - `sessionController.rename` and `resolveAgent` resume a cold session, so naming one
   whose recorded `agentPreset` no longer exists fails with `Unknown agent preset`.
+- A forked branch is renamed only after its own first turn completes with work; a
+  branch forked and never used keeps the inherited `<parent title> (N)`, and the
+  branch rename lands at `turn/end`, so it lags the same way a first title does.
+- The catch-up sweep covers a forked branch only when it has its own completed work
+  and falls inside the same 48 h / 5 per start bounds; older unused branches are left
+  to `summarize` or the next turn.
 - `D:\__CODE__` is inside a file-sync scope on this machine, so in-place edits can
   briefly fail with a Windows sharing violation; retry.

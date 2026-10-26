@@ -1,8 +1,8 @@
 {
   "name": "@chi-hong22/dsh-session-autoname",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
-  "description": "Session auto-naming in the strict MMDD｜type｜topic form for DeepSeek Harness: registers the single session-title provider so the official conversation-following schedule drives it, disables the stock first-prompt provider in its bundle patch, names from the whole turn (human prompt, assistant work, tool calls), and keeps the on-demand naming of any specified conversation. Mutually exclusive with the official conversation-following titles plugin: both claim the same provider slot",
+  "description": "Session auto-naming in the strict MMDD｜type｜topic form for DeepSeek Harness: registers the single session-title provider so the official conversation-following schedule drives it, disables the stock first-prompt provider in its bundle patch, names from the whole turn (human prompt, assistant work, tool calls), names forked branches from their own work while keeping the branch counter, and keeps the on-demand naming of any specified conversation. Mutually exclusive with the official conversation-following titles plugin: both claim the same provider slot",
   "keywords": [
     "dsh",
     "dsh-plugin",
